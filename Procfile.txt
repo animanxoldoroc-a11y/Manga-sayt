@@ -1,1 +1,1 @@
-web: python Asos.py
+web: gunicorn app:app
