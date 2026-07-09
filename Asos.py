@@ -3,20 +3,25 @@
 ==========================================================================
   MANGA OLAMI  —  to'liq bitta fayldagi manga/manhwa o'qish sayti
 ==========================================================================
-  Texnologiya : Python + Flask + SQLite  (tashqi kutubxona shart emas)
-  Muallif uchun: Abdulahad
-  Railway uchun moslashtirilgan variant (2026)
+  Texnologiya : Python + Flask + SQLite
+  PDF -> sahifa : PyMuPDF (requirements.txt ga qo'shilgan)
+  Kirish       : Google orqali (parolsiz) + admin uchun zaxira parol
+  Muallif      : Ayubxon (ANIMAN)
+  Railway (2026) uchun moslashtirilgan
 ==========================================================================
 """
 
 import os
+import json
 import sqlite3
 import secrets
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from functools import wraps
 
 from flask import (
-    Flask, request, session, redirect, url_for, g,
+    Flask, request, session, redirect, url_for, g, jsonify,
     render_template_string, flash, abort, send_from_directory,
 )
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -24,24 +29,32 @@ from werkzeug.security import generate_password_hash, check_password_hash
 # ------------------------------------------------------------------ SOZLAMALAR
 SITE_NAME = "Manga olami"
 TELEGRAM_ADMIN = "https://t.me/animan_only"
-ADMIN_LOGIN = "admin"
-ADMIN_PASSWORD = "admin123"
 COIN_NAME = "tanga"
+
+# Zaxira admin (Google sozlanmagan bo'lsa ham kira olishingiz uchun)
+ADMIN_LOGIN = os.environ.get("ADMIN_LOGIN", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
+
+# --- GOOGLE KIRISH SOZLAMALARI (Railway "Variables" bo'limiga qo'ying) ---
+#   GOOGLE_CLIENT_ID  -> Google Cloud Console'dan olingan "Web client" ID
+#   ADMIN_EMAIL       -> Qaysi Google email admin bo'lishini yozing (masalan siznikini)
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
+
+ALLOWED_EXT = {"png", "jpg", "jpeg", "webp", "gif"}
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 
-# RAILWAY UCHUN MUHIM: Ma'lumotlar o'chib ketmasligi uchun bazani xavfsizroq joyga qo'yamiz.
-# Agar Railway-da "Volume" ulasangiz, uning yo'lini muhit o'zgaruvchisiga (masalan: VOLUME_PATH) yozib qo'ying.
+# RAILWAY: ma'lumotlar o'chib ketmasligi uchun "Volume" ulab, VOLUME_PATH bering.
 RAILWAY_VOLUME = os.environ.get("VOLUME_PATH", BASE_DIR)
 DB_PATH = os.path.join(RAILWAY_VOLUME, "manga_olami.db")
 UPLOAD_DIR = os.path.join(RAILWAY_VOLUME, "uploads")
-
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__)
-# Maxfiy kalit har safar restart bo'lganda o'zgarib ketmasligi uchun Railway o'zgaruvchisidan yoki qat'iy kalitdan foydalanamiz
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "manga-olami-super-secret-key-12345")
-app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
+_max_mb = int(os.environ.get("MAX_UPLOAD_MB", "128"))
+app.config["MAX_CONTENT_LENGTH"] = _max_mb * 1024 * 1024
 
 
 # ============================================================ MA'LUMOTLAR BAZASI
@@ -60,6 +73,20 @@ def close_db(exc):
         db.close()
 
 
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def ensure_columns(db):
+    """Eski bazaga yangi ustunlarni xavfsiz qo'shish (migratsiya)."""
+    have = {r[1] for r in db.execute("PRAGMA table_info(users)").fetchall()}
+    for col, ddl in (("email", "email TEXT"),
+                     ("google_id", "google_id TEXT"),
+                     ("avatar", "avatar TEXT")):
+        if col not in have:
+            db.execute(f"ALTER TABLE users ADD COLUMN {ddl}")
+
+
 def init_db():
     db = sqlite3.connect(DB_PATH)
     db.executescript(
@@ -67,7 +94,10 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             username     TEXT UNIQUE NOT NULL,
-            password     TEXT NOT NULL,
+            password     TEXT NOT NULL DEFAULT '',
+            email        TEXT,
+            google_id    TEXT,
+            avatar       TEXT,
             coins        INTEGER DEFAULT 0,
             is_admin     INTEGER DEFAULT 0,
             created_at   TEXT
@@ -131,8 +161,10 @@ def init_db():
         """
     )
     db.commit()
+    ensure_columns(db)
+    db.commit()
 
-    # Boshlang'ich admin
+    # Zaxira admin (parol bilan)
     cur = db.execute("SELECT id FROM users WHERE username=?", (ADMIN_LOGIN,))
     if cur.fetchone() is None:
         db.execute(
@@ -147,10 +179,6 @@ def init_db():
         seed_demo(db)
 
     db.close()
-
-
-def now():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def slugify(text):
@@ -213,7 +241,6 @@ def login_required(f):
             flash("Avval tizimga kiring.", "warn")
             return redirect(url_for("login", next=request.path))
         return f(*a, **kw)
-
     return wrap
 
 
@@ -224,7 +251,6 @@ def admin_required(f):
         if not u or not u["is_admin"]:
             abort(403)
         return f(*a, **kw)
-
     return wrap
 
 
@@ -243,6 +269,41 @@ def save_upload(file_storage):
     return url_for("uploaded_file", filename=name)
 
 
+def pdf_to_page_urls(pdf_storage, zoom=2.0):
+    """PDF faylni sahifalarga (PNG) bo'lib, URL ro'yxatini qaytaradi."""
+    if not pdf_storage or pdf_storage.filename == "":
+        return [], None
+    if not pdf_storage.filename.lower().endswith(".pdf"):
+        return None, "Iltimos .pdf fayl yuklang."
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return None, ("PyMuPDF o'rnatilmagan. requirements.txt ga 'PyMuPDF' "
+                      "qo'shib, qayta deploy qiling.")
+    tmp = os.path.join(UPLOAD_DIR, "tmp_" + secrets.token_hex(8) + ".pdf")
+    pdf_storage.save(tmp)
+    urls = []
+    try:
+        doc = fitz.open(tmp)
+        mat = fitz.Matrix(zoom, zoom)
+        for i in range(len(doc)):
+            pix = doc.load_page(i).get_pixmap(matrix=mat)
+            name = secrets.token_hex(16) + ".png"
+            pix.save(os.path.join(UPLOAD_DIR, name))
+            urls.append(url_for("uploaded_file", filename=name))
+        doc.close()
+    except Exception as e:  # noqa
+        return None, f"PDF o'qishda xatolik: {e}"
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    if not urls:
+        return None, "PDF ichida sahifa topilmadi."
+    return urls, None
+
+
 @app.route("/uploads/<path:filename>")
 def uploaded_file(filename):
     return send_from_directory(UPLOAD_DIR, filename)
@@ -253,35 +314,119 @@ def inject_globals():
     return dict(
         SITE_NAME=SITE_NAME, COIN_NAME=COIN_NAME,
         TELEGRAM_ADMIN=TELEGRAM_ADMIN, user=current_user(),
+        GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID, GOOGLE_ENABLED=bool(GOOGLE_CLIENT_ID),
     )
+
+
+# ============================================================ GOOGLE KIRISH
+def _unique_username(base):
+    db = get_db()
+    base = "".join(ch for ch in (base or "") if ch.isalnum() or ch in " _-").strip()
+    base = (base or "user")[:20]
+    uname = base
+    i = 1
+    while db.execute("SELECT 1 FROM users WHERE username=?", (uname,)).fetchone():
+        i += 1
+        uname = f"{base}{i}"
+    return uname
+
+
+def verify_google_token(credential):
+    """Google ID tokenni tokeninfo endpoint orqali tekshiradi."""
+    if not credential:
+        return None
+    url = "https://oauth2.googleapis.com/tokeninfo?" + urllib.parse.urlencode(
+        {"id_token": credential})
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "manga-olami"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+    if GOOGLE_CLIENT_ID and data.get("aud") != GOOGLE_CLIENT_ID:
+        return None
+    if not data.get("sub"):
+        return None
+    return data
+
+
+@app.route("/auth/google", methods=["POST"])
+def auth_google():
+    credential = request.form.get("credential", "")
+    if not GOOGLE_CLIENT_ID:
+        return jsonify(ok=False, error="Google kirish sozlanmagan (GOOGLE_CLIENT_ID yo'q).")
+    info = verify_google_token(credential)
+    if not info:
+        return jsonify(ok=False, error="Google token tekshiruvdan o'tmadi.")
+
+    db = get_db()
+    email = (info.get("email") or "").strip().lower()
+    sub = info.get("sub")
+    name = info.get("name") or (email.split("@")[0] if email else "user")
+    avatar = info.get("picture") or ""
+    is_admin_flag = 1 if (ADMIN_EMAIL and email == ADMIN_EMAIL) else 0
+
+    # Avval google_id, keyin email bo'yicha qidiramiz -> bir xil akkaunt qaytadi
+    u = db.execute("SELECT * FROM users WHERE google_id=?", (sub,)).fetchone()
+    if not u and email:
+        u = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+
+    if u:
+        db.execute("UPDATE users SET google_id=?, email=?, avatar=? WHERE id=?",
+                   (sub, email, avatar, u["id"]))
+        if is_admin_flag:
+            db.execute("UPDATE users SET is_admin=1 WHERE id=?", (u["id"],))
+        db.commit()
+        uid = u["id"]
+    else:
+        username = _unique_username(name)
+        db.execute(
+            "INSERT INTO users (username, password, email, google_id, avatar, "
+            "coins, is_admin, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (username, "", email, sub, avatar, 0, is_admin_flag, now()))
+        db.commit()
+        uid = db.execute("SELECT id FROM users WHERE google_id=?", (sub,)).fetchone()["id"]
+
+    session["uid"] = uid
+    nxt = request.args.get("next") or request.form.get("next")
+    return jsonify(ok=True, redirect=(nxt or url_for("index")))
 
 
 # ================================================================= DIZAYN / CSS
 CSS = """
 :root{
-  --bg:#0d0b1a; --bg2:#120f24; --surface:#171334; --surface2:#1e1942;
-  --border:#2c2658; --text:#ece9ff; --muted:#9a94c4;
+  --bg:#0b0918; --bg2:#100d22; --surface:#161232; --surface2:#1d1840;
+  --border:#2c2658; --border2:#3a3370; --text:#eceaff; --muted:#9a94c4;
   --gold:#f5b942; --gold-soft:#ffcf6b; --pink:#ff4d6d; --violet:#8b5cf6;
-  --radius:16px; --shadow:0 10px 40px rgba(0,0,0,.45);
+  --radius:16px; --shadow:0 14px 46px rgba(0,0,0,.5);
 }
 *{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
 body{
   background:
-    radial-gradient(900px 500px at 12% -10%, rgba(139,92,246,.18), transparent 60%),
-    radial-gradient(800px 500px at 100% 0%, rgba(245,185,66,.10), transparent 55%),
+    radial-gradient(1000px 560px at 12% -12%, rgba(139,92,246,.22), transparent 60%),
+    radial-gradient(900px 560px at 100% -6%, rgba(245,185,66,.12), transparent 55%),
     var(--bg);
   color:var(--text); font-family:'Inter',system-ui,-apple-system,sans-serif;
-  min-height:100vh; line-height:1.55;
+  min-height:100vh; line-height:1.55; -webkit-font-smoothing:antialiased;
+  overflow-x:hidden; -webkit-tap-highlight-color:transparent;
 }
 a{color:inherit;text-decoration:none}
 img{display:block;max-width:100%}
 .container{max-width:1180px;margin:0 auto;padding:0 20px}
+::selection{background:rgba(245,185,66,.3)}
+::-webkit-scrollbar{width:10px}
+::-webkit-scrollbar-track{background:var(--bg2)}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:10px}
+
+@keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+.fade{animation:fadeUp .5s ease both}
 
 /* ---- Navbar ---- */
-.nav{position:sticky;top:0;z-index:50;
-  background:rgba(13,11,26,.82);backdrop-filter:blur(14px);
+.nav{position:sticky;top:0;z-index:60;
+  background:rgba(11,9,24,.86);backdrop-filter:blur(16px);
   border-bottom:1px solid var(--border)}
-.nav-in{display:flex;align-items:center;gap:22px;height:66px}
+.nav-in{display:flex;align-items:center;gap:18px;height:66px}
 .brand{font-family:'Unbounded',sans-serif;font-weight:800;font-size:1.35rem;
   letter-spacing:.5px;background:linear-gradient(100deg,var(--gold),var(--pink));
   -webkit-background-clip:text;background-clip:text;color:transparent;white-space:nowrap}
@@ -289,30 +434,47 @@ img{display:block;max-width:100%}
 .nav-links a{padding:8px 14px;border-radius:10px;color:var(--muted);
   font-weight:600;font-size:.95rem;transition:.15s}
 .nav-links a:hover{color:var(--text);background:var(--surface)}
-.nav-right{display:flex;align-items:center;gap:10px}
+.nav-right{display:flex;align-items:center;gap:10px;margin-left:auto}
+.avatar{width:34px;height:34px;border-radius:50%;object-fit:cover;
+  border:2px solid var(--gold)}
 .coin-pill{display:flex;align-items:center;gap:7px;padding:7px 14px;
   border-radius:999px;background:linear-gradient(120deg,#3a2f10,#2a2450);
   border:1px solid var(--gold);font-weight:700;color:var(--gold-soft)}
 .coin-pill .dot{width:16px;height:16px;border-radius:50%;
   background:radial-gradient(circle at 35% 30%,#ffe6a0,var(--gold));
   box-shadow:0 0 10px rgba(245,185,66,.6)}
-.btn{display:inline-flex;align-items:center;gap:8px;padding:9px 18px;
-  border-radius:11px;font-weight:700;font-size:.95rem;cursor:pointer;
+.nav-burger{display:none;background:var(--surface);border:1px solid var(--border);
+  color:var(--text);width:44px;height:40px;border-radius:11px;font-size:1.3rem;
+  cursor:pointer;align-items:center;justify-content:center}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  padding:9px 18px;border-radius:11px;font-weight:700;font-size:.95rem;cursor:pointer;
   border:1px solid transparent;transition:.15s;white-space:nowrap}
 .btn-primary{background:linear-gradient(120deg,var(--gold),var(--pink));color:#1a1030}
-.btn-primary:hover{filter:brightness(1.08);transform:translateY(-1px)}
+.btn-primary:hover{filter:brightness(1.08);transform:translateY(-1px);
+  box-shadow:0 8px 24px rgba(255,77,109,.28)}
 .btn-danger{background:linear-gradient(120deg,var(--pink),#ff1a40);color:#fff}
 .btn-danger:hover{filter:brightness(1.08);transform:translateY(-1px)}
 .btn-ghost{background:var(--surface);border-color:var(--border);color:var(--text)}
-.btn-ghost:hover{background:var(--surface2)}
+.btn-ghost:hover{background:var(--surface2);border-color:var(--border2)}
 .btn-tg{background:linear-gradient(120deg,#2aa9e0,#1c7fc4);color:#fff}
+.btn-tg:hover{filter:brightness(1.08)}
 
 /* ---- Hero ---- */
-.hero{position:relative;padding:56px 0 34px;overflow:hidden}
-.hero h1{font-family:'Sora',sans-serif;font-size:clamp(2rem,5vw,3.4rem);
-  font-weight:800;line-height:1.05;max-width:720px;letter-spacing:-.5px}
+.hero{position:relative;padding:64px 0 40px;overflow:hidden}
+.hero::before{content:"";position:absolute;inset:-40% 30% auto auto;width:420px;height:420px;
+  background:radial-gradient(circle,rgba(139,92,246,.28),transparent 70%);filter:blur(8px);
+  animation:glow 8s ease-in-out infinite alternate;pointer-events:none}
+@keyframes glow{from{transform:translate(0,0)}to{transform:translate(-40px,30px)}}
+.hero h1{font-family:'Sora',sans-serif;font-size:clamp(2.1rem,5.4vw,3.5rem);
+  font-weight:800;line-height:1.05;max-width:740px;letter-spacing:-.5px}
+.hero .hl{background:linear-gradient(100deg,var(--gold),var(--pink));
+  -webkit-background-clip:text;background-clip:text;color:transparent}
 .hero p{color:var(--muted);margin-top:16px;font-size:1.08rem;max-width:560px}
 .hero .cta{display:flex;gap:12px;margin-top:26px;flex-wrap:wrap}
+.hero-stats{display:flex;gap:26px;margin-top:30px;flex-wrap:wrap}
+.hero-stats .s .n{font-family:'Sora';font-size:1.6rem;font-weight:800;color:var(--gold)}
+.hero-stats .s .l{color:var(--muted);font-size:.85rem}
 
 /* ---- Sections ---- */
 .section{padding:34px 0}
@@ -327,25 +489,28 @@ img{display:block;max-width:100%}
 /* ---- Manga grid ---- */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:20px}
 .card{background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius);overflow:hidden;transition:.18s;position:relative}
-.card:hover{transform:translateY(-4px);border-color:var(--violet);box-shadow:var(--shadow)}
-.card .cover{aspect-ratio:5/7;width:100%;object-fit:cover;background:var(--surface2)}
+  border-radius:var(--radius);overflow:hidden;transition:.2s;position:relative}
+.card:hover{transform:translateY(-5px);border-color:var(--violet);box-shadow:var(--shadow)}
+.card .cover-wrap{position:relative;overflow:hidden}
+.card .cover{aspect-ratio:5/7;width:100%;object-fit:cover;background:var(--surface2);
+  transition:transform .45s ease}
+.card:hover .cover{transform:scale(1.06)}
 .card .body{padding:12px 13px 14px}
 .card .title{font-weight:700;font-size:.98rem;line-height:1.25;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .card .genres{color:var(--muted);font-size:.78rem;margin-top:5px}
 .card .rating{position:absolute;top:10px;left:10px;padding:4px 9px;border-radius:8px;
-  background:rgba(13,11,26,.82);border:1px solid var(--gold);color:var(--gold-soft);
-  font-weight:700;font-size:.8rem;backdrop-filter:blur(4px)}
+  background:rgba(11,9,24,.82);border:1px solid var(--gold);color:var(--gold-soft);
+  font-weight:700;font-size:.8rem;backdrop-filter:blur(4px);z-index:2}
 .badge-prem{position:absolute;top:10px;right:10px;padding:3px 8px;border-radius:8px;
   background:linear-gradient(120deg,var(--gold),var(--pink));color:#1a1030;
-  font-weight:800;font-size:.68rem}
+  font-weight:800;font-size:.68rem;z-index:2}
 
 /* ---- List ---- */
 .rows{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .row{display:flex;gap:13px;padding:12px;background:var(--surface);
   border:1px solid var(--border);border-radius:14px;transition:.15s}
-.row:hover{border-color:var(--violet)}
+.row:hover{border-color:var(--violet);transform:translateY(-2px)}
 .row img{width:56px;height:76px;object-fit:cover;border-radius:9px;flex-shrink:0}
 .row .meta{min-width:0}
 .row .meta .t{font-weight:700;font-size:.95rem;overflow:hidden;
@@ -361,15 +526,25 @@ label{display:block;font-weight:600;font-size:.88rem;margin:14px 0 6px;color:var
 input,textarea,select{width:100%;padding:12px 14px;border-radius:11px;
   background:var(--bg2);border:1px solid var(--border);color:var(--text);
   font-size:.98rem;font-family:inherit}
-input:focus,textarea:focus,select:focus{outline:none;border-color:var(--violet)}
+input:focus,textarea:focus,select:focus{outline:none;border-color:var(--violet);
+  box-shadow:0 0 0 3px rgba(139,92,246,.18)}
 textarea{min-height:100px;resize:vertical}
 .row-2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.form-wrap{max-width:440px;margin:40px auto}
+.form-wrap{max-width:440px;margin:48px auto}
 .check{display:flex;align-items:center;gap:10px;margin-top:14px}
 .check input{width:auto}
+.hint{color:var(--muted);font-size:.82rem;margin-top:6px}
+.divider{display:flex;align-items:center;gap:12px;color:var(--muted);
+  font-size:.82rem;margin:22px 0}
+.divider::before,.divider::after{content:"";flex:1;height:1px;background:var(--border)}
+details.admin-fallback{margin-top:22px;border-top:1px solid var(--border);padding-top:14px}
+details.admin-fallback summary{cursor:pointer;color:var(--muted);font-size:.86rem;
+  font-weight:600;list-style:none}
+details.admin-fallback summary::-webkit-details-marker{display:none}
+.gbtn-wrap{display:flex;justify-content:center;margin:10px 0 4px;min-height:44px}
 
 /* ---- Reader ---- */
-.reader{max-width:800px;margin:0 auto;padding:20px}
+.reader{max-width:820px;margin:0 auto;padding:20px}
 .reader img{width:100%;border-radius:6px;margin-bottom:4px;background:var(--surface2)}
 .reader-bar{display:flex;justify-content:space-between;align-items:center;
   gap:12px;padding:16px 0;flex-wrap:wrap}
@@ -388,9 +563,9 @@ textarea{min-height:100px;resize:vertical}
 .chapter{display:flex;justify-content:space-between;align-items:center;
   padding:14px 16px;background:var(--surface);border:1px solid var(--border);
   border-radius:12px;transition:.15s}
-.chapter:hover{border-color:var(--violet);background:var(--surface2)}
+.chapter:hover{border-color:var(--violet);background:var(--surface2);transform:translateX(3px)}
 .chapter .cprice{color:var(--gold);font-weight:700;font-size:.86rem}
-.chapter .free">Bepul</span>
+.free{color:#8ef0b0;font-weight:600;font-size:.86rem}
 
 /* ---- Flash ---- */
 .flashes{position:fixed;top:78px;right:20px;z-index:100;display:flex;
@@ -418,20 +593,87 @@ footer{border-top:1px solid var(--border);margin-top:50px;padding:36px 0;color:v
 .pageid{font-family:'Sora',monospace;background:var(--bg2);border:1px dashed var(--gold);
   padding:6px 12px;border-radius:9px;color:var(--gold-soft);font-weight:700}
 
+/* ---- Floating Telegram ---- */
+.fab{position:fixed;right:18px;bottom:18px;z-index:70;display:flex;align-items:center;
+  gap:9px;padding:12px 16px;border-radius:999px;font-weight:700;color:#fff;
+  background:linear-gradient(120deg,#2aa9e0,#1c7fc4);box-shadow:0 10px 30px rgba(28,127,196,.45);
+  transition:.18s}
+.fab:hover{transform:translateY(-2px) scale(1.03)}
+
+/* ---- Pastki tab-menyu (faqat telefon) ---- */
+.bottomnav{display:none}
+
+@media(max-width:820px){
+  .nav-in{height:58px;gap:10px}
+  .nav-links{display:none}
+  .nav-logout{display:none}
+  .brand{font-size:1.15rem}
+  .coin-pill{padding:6px 11px}
+  .avatar{width:32px;height:32px}
+  .hero{padding:38px 0 24px}
+  .hero p{font-size:1rem;margin-top:12px}
+  .hero .cta{margin-top:20px}
+  .hero-stats{gap:20px;margin-top:24px}
+  .section{padding:24px 0}
+  .sec-head{margin-bottom:16px}
+
+  /* iOS zoom oldini olish uchun 16px */
+  input,select,textarea{font-size:16px}
+
+  .flashes{top:64px;right:10px;left:10px;max-width:none}
+  .form-wrap{margin:24px auto}
+  .reader{padding:10px 8px}
+  .reader-bar{padding:12px 0}
+  .reader-bar .btn{flex:1}
+
+  /* Suzuvchi Telegram tugmasi — pastki menyu tepasiga, ixcham */
+  .fab{padding:13px;font-size:0;right:14px;
+    bottom:calc(74px + env(safe-area-inset-bottom))}
+  .fab::before{content:"✈";font-size:1.25rem}
+
+  /* Pastki navigatsiya */
+  .bottomnav{display:flex;position:fixed;left:0;right:0;bottom:0;z-index:80;
+    background:rgba(11,9,24,.97);backdrop-filter:blur(18px);
+    border-top:1px solid var(--border);justify-content:space-around;
+    padding:8px 6px calc(8px + env(safe-area-inset-bottom))}
+  .bottomnav a{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;
+    color:var(--muted);font-size:.68rem;font-weight:600;padding:5px 2px;border-radius:12px;
+    transition:.15s}
+  .bottomnav a .i{font-size:1.3rem;line-height:1}
+  .bottomnav a:active{background:var(--surface)}
+  .bottomnav a.on{color:var(--gold)}
+  .bottomnav a.on .i{filter:drop-shadow(0 0 8px rgba(245,185,66,.55))}
+
+  /* Kontent pastki menyu ostida qolib ketmasligi uchun */
+  body{padding-bottom:calc(66px + env(safe-area-inset-bottom))}
+}
+
 @media(max-width:720px){
   .rows{grid-template-columns:1fr}
   .detail-top{grid-template-columns:1fr}
-  .detail-top .cover{width:170px}
+  .detail-top .cover{width:100%;max-width:220px}
+  .detail-top h1{font-size:1.55rem}
   .row-2{grid-template-columns:1fr}
-  .nav-links{display:none}
+  .grid{grid-template-columns:repeat(2,1fr);gap:12px}
+  .panel{padding:18px}
+  .sec-head h2{font-size:1.3rem}
+  .card .title{font-size:.9rem}
+  .card .cover{padding:10px}
+}
+
+@media(max-width:380px){
+  .brand{font-size:1.05rem}
+  .coin-pill{padding:5px 9px;font-size:.85rem}
+  .bottomnav a{font-size:.62rem}
+  .bottomnav a .i{font-size:1.2rem}
 }
 """
 
 # ================================================================ ASOSIY SHABLON
 BASE = """
 <!doctype html><html lang="uz"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#0d0b1a">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0918">
 <title>{{ title or SITE_NAME }}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Sora:wght@600;700;800&family=Unbounded:wght@700;800&display=swap" rel="stylesheet">
@@ -440,7 +682,7 @@ BASE = """
 
 <nav class="nav"><div class="container nav-in">
   <a href="{{ url_for('index') }}" class="brand">◈ {{ SITE_NAME }}</a>
-  <div class="nav-links">
+  <div class="nav-links" id="navlinks">
     <a href="{{ url_for('index') }}">Bosh sahifa</a>
     <a href="{{ url_for('catalog') }}">Katalog</a>
     {% if user %}<a href="{{ url_for('bookmarks') }}">Saqlanganlar</a>{% endif %}
@@ -450,11 +692,13 @@ BASE = """
   <div class="nav-right">
     {% if user %}
       <a href="{{ url_for('coins') }}" class="coin-pill"><span class="dot"></span>{{ user['coins'] }}</a>
-      <a href="{{ url_for('profile') }}" class="btn btn-ghost">{{ user['username'] }}</a>
-      <a href="{{ url_for('logout') }}" class="btn btn-ghost">Chiqish</a>
+      <a href="{{ url_for('profile') }}" title="{{ user['username'] }}">
+        {% if user['avatar'] %}<img class="avatar" src="{{ user['avatar'] }}" alt="">
+        {% else %}<span class="btn btn-ghost">{{ user['username'] }}</span>{% endif %}
+      </a>
+      <a href="{{ url_for('logout') }}" class="btn btn-ghost nav-logout">Chiqish</a>
     {% else %}
-      <a href="{{ url_for('login') }}" class="btn btn-ghost">Kirish</a>
-      <a href="{{ url_for('register') }}" class="btn btn-primary">Ro'yxatdan o'tish</a>
+      <a href="{{ url_for('login') }}" class="btn btn-primary">Kirish</a>
     {% endif %}
   </div>
 </div></nav>
@@ -468,6 +712,17 @@ BASE = """
 {% endwith %}
 
 <main>{{ body|safe }}</main>
+
+<a href="{{ TELEGRAM_ADMIN }}" target="_blank" class="fab" title="Telegram admin">✈ Admin</a>
+
+<nav class="bottomnav">
+  <a href="{{ url_for('index') }}" class="{{ 'on' if request.path == '/' }}"><span class="i">🏠</span>Bosh</a>
+  <a href="{{ url_for('catalog') }}" class="{{ 'on' if '/catalog' in request.path or '/manga' in request.path or '/read' in request.path }}"><span class="i">🔍</span>Katalog</a>
+  {% if user %}<a href="{{ url_for('bookmarks') }}" class="{{ 'on' if '/bookmark' in request.path }}"><span class="i">☆</span>Saqlangan</a>{% endif %}
+  <a href="{{ url_for('coins') }}" class="{{ 'on' if '/coins' in request.path }}"><span class="i">◉</span>Tanga</a>
+  {% if user %}<a href="{{ url_for('profile') }}" class="{{ 'on' if '/profile' in request.path or '/admin' in request.path }}"><span class="i">👤</span>Profil</a>
+  {% else %}<a href="{{ url_for('login') }}" class="{{ 'on' if '/login' in request.path }}"><span class="i">👤</span>Kirish</a>{% endif %}
+</nav>
 
 <footer><div class="container foot-in">
   <div style="max-width:340px">
@@ -509,15 +764,21 @@ def index():
     latest = db.execute("""
         SELECT m.*, (SELECT MAX(number) FROM chapters c WHERE c.manga_id=m.id) AS last_ch
         FROM manga m ORDER BY m.created_at DESC, m.id DESC LIMIT 8""").fetchall()
-    top = db.execute("SELECT * FROM manga ORDER BY rating DESC LIMIT 10").fetchall()
+    total_manga = db.execute("SELECT COUNT(*) FROM manga").fetchone()[0]
+    total_chapters = db.execute("SELECT COUNT(*) FROM chapters").fetchone()[0]
 
     tpl = """
-    <section class="hero"><div class="container">
-      <h1>Manga olamiga xush kelibsiz</h1>
+    <section class="hero"><div class="container fade">
+      <h1>Manga <span class="hl">olamiga</span> xush kelibsiz</h1>
       <p>Minglab boblar, sara tarjimalar va yangi chiqqan manhwalar — hammasi bir joyda, o'zbek tilida.</p>
       <div class="cta">
         <a href="{{ url_for('catalog') }}" class="btn btn-primary">Katalogni ko'rish</a>
         <a href="{{ url_for('coins') }}" class="btn btn-ghost"><span style="color:var(--gold)">◉</span> Tanga sotib olish</a>
+      </div>
+      <div class="hero-stats">
+        <div class="s"><div class="n">{{ total_manga }}</div><div class="l">Asar</div></div>
+        <div class="s"><div class="n">{{ total_chapters }}</div><div class="l">Bob</div></div>
+        <div class="s"><div class="n">Uz</div><div class="l">Tarjima</div></div>
       </div>
     </div></section>
 
@@ -549,7 +810,8 @@ def index():
       </div>
     </div></section>
     """
-    return render(tpl, popular=popular, latest=latest, top=top,
+    return render(tpl, popular=popular, latest=latest,
+                  total_manga=total_manga, total_chapters=total_chapters,
                   card=card_macro, title=SITE_NAME)
 
 
@@ -559,8 +821,8 @@ def card_macro(m):
         (m["id"],)).fetchone()
     return render_template_string("""
     <a href="{{ url_for('manga_detail', slug=m['slug']) }}" class="card">
-      <div style="position:relative">
-        <img class="cover" src="{{ m['cover'] }}" alt="{{ m['title'] }}">
+      <div class="cover-wrap">
+        <img class="cover" src="{{ m['cover'] }}" alt="{{ m['title'] }}" loading="lazy">
         <span class="rating">★ {{ '%.1f'|format(m['rating']) }}</span>
         {% if prem %}<span class="badge-prem">PREMIUM</span>{% endif %}
       </div>
@@ -582,10 +844,10 @@ def catalog():
     sql = "SELECT * FROM manga WHERE 1=1"
     params = []
     if q:
-        sql += " AND title LIKE ?";
+        sql += " AND title LIKE ?"
         params.append(f"%{q}%")
     if genre:
-        sql += " AND genres LIKE ?";
+        sql += " AND genres LIKE ?"
         params.append(f"%{genre}%")
     sql += " ORDER BY rating DESC" if sort == "rating" else " ORDER BY id DESC"
     items = db.execute(sql, params).fetchall()
@@ -642,7 +904,7 @@ def manga_detail(slug):
             (u["id"], m["id"])).fetchone() is not None
 
     tpl = """
-    <div class="container detail-top">
+    <div class="container detail-top fade">
       <div>
         <img class="cover" src="{{ m['cover'] }}" alt="{{ m['title'] }}">
         {% if user %}
@@ -652,8 +914,6 @@ def manga_detail(slug):
           </button>
         </form>
         {% endif %}
-
-        {# ADMIN UCHUN MANGA O'CHIRISH TUGMASI #}
         {% if user and user['is_admin'] %}
         <form method="post" action="{{ url_for('admin_delete_manga', manga_id=m['id']) }}" style="margin-top:10px" onsubmit="return confirm('Haqiqatdan ham ushbu mangani butunlay o‘chirmoqchimisiz?');">
           <button class="btn btn-danger" style="width:100%">🗑 Mangani o'chirish</button>
@@ -665,7 +925,7 @@ def manga_detail(slug):
         <div class="tags">
           <span class="tag">★ {{ '%.1f'|format(m['rating']) }}</span>
           <span class="tag">{{ m['status'] }}</span>
-          {% for g in m['genres'].split(',') %}<span class="tag">{{ g.strip() }}</span>{% endfor %}
+          {% for g in m['genres'].split(',') if g.strip() %}<span class="tag">{{ g.strip() }}</span>{% endfor %}
         </div>
         <p style="color:var(--muted);max-width:640px">{{ m['description'] }}</p>
 
@@ -818,73 +1078,74 @@ def bookmarks():
 
 
 # ----------------------------------------------------------------- AUTH
-@app.route("/register", methods=["GET", "POST"])
+@app.route("/register")
 def register():
-    if current_user():
-        return redirect(url_for("index"))
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        pw = request.form.get("password", "")
-        pw2 = request.form.get("password2", "")
-        db = get_db()
-        if len(username) < 3:
-            flash("Login kamida 3 ta belgidan iborat bo'lsin.", "err")
-        elif len(pw) < 4:
-            flash("Parol kamida 4 ta belgidan iborat bo'lsin.", "err")
-        elif pw != pw2:
-            flash("Parollar mos kelmadi.", "err")
-        elif db.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
-            flash("Bu login band.", "err")
-        else:
-            db.execute(
-                "INSERT INTO users (username, password, coins, is_admin, created_at) "
-                "VALUES (?,?,?,?,?)",
-                (username, generate_password_hash(pw), 0, 0, now()))
-            db.commit()
-            uid = db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()["id"]
-            session["uid"] = uid
-            flash("Xush kelibsiz! Ro'yxatdan o'tdingiz.", "ok")
-            return redirect(url_for("index"))
-    tpl = """
-    <div class="form-wrap panel">
-      <h3>Ro'yxatdan o'tish</h3>
-      <form method="post">
-        <label>Login</label><input name="username" required autofocus>
-        <label>Parol</label><input type="password" name="password" required>
-        <label>Parolni takrorlang</label><input type="password" name="password2" required>
-        <button class="btn btn-primary" style="width:100%;margin-top:20px">Ro'yxatdan o'tish</button>
-      </form>
-      <p style="margin-top:16px;color:var(--muted);font-size:.9rem">
-        Hisobingiz bormi? <a href="{{ url_for('login') }}" style="color:var(--gold)">Kirish</a></p>
-    </div>
-    """
-    return render(tpl, title="Ro'yxatdan o'tish")
+    # Faqat Google orqali kirish — ro'yxatdan o'tish alohida emas
+    return redirect(url_for("login"))
 
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if current_user():
         return redirect(url_for("index"))
+
+    # POST -> zaxira admin (login/parol)
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         pw = request.form.get("password", "")
         u = get_db().execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
-        if u and check_password_hash(u["password"], pw):
+        if u and u["password"] and check_password_hash(u["password"], pw):
             session["uid"] = u["id"]
             flash("Tizimga kirdingiz.", "ok")
             nxt = request.args.get("next")
             return redirect(nxt or url_for("index"))
         flash("Login yoki parol xato.", "err")
+
     tpl = """
-    <div class="form-wrap panel">
-      <h3>Kirish</h3>
-      <form method="post">
-        <label>Login</label><input name="username" required autofocus>
-        <label>Parol</label><input type="password" name="password" required>
-        <button class="btn btn-primary" style="width:100%;margin-top:20px">Kirish</button>
-      </form>
-      <p style="margin-top:16px;color:var(--muted);font-size:.9rem">
-        Hisobingiz yo'qmi? <a href="{{ url_for('register') }}" style="color:var(--gold)">Ro'yxatdan o'tish</a></p>
+    <div class="form-wrap panel fade">
+      <h3>Tizimga kirish</h3>
+      <p style="color:var(--muted);font-size:.92rem;margin-bottom:6px">
+        Google akkauntingiz orqali bir marta bosib kiring — parol kerak emas.</p>
+
+      {% if GOOGLE_ENABLED %}
+        <script src="https://accounts.google.com/gsi/client" async></script>
+        <div id="g_id_onload"
+             data-client_id="{{ GOOGLE_CLIENT_ID }}"
+             data-callback="handleGoogle"
+             data-auto_prompt="false"></div>
+        <div class="gbtn-wrap">
+          <div class="g_id_signin"
+               data-type="standard" data-theme="filled_black"
+               data-size="large" data-text="continue_with"
+               data-shape="pill" data-logo_alignment="left"></div>
+        </div>
+        <script>
+          function handleGoogle(resp){
+            fetch("{{ url_for('auth_google') }}{% if request.args.get('next') %}?next={{ request.args.get('next')|urlencode }}{% endif %}", {
+              method:"POST",
+              headers:{"Content-Type":"application/x-www-form-urlencoded"},
+              body:"credential="+encodeURIComponent(resp.credential)
+            }).then(function(r){return r.json();}).then(function(d){
+              if(d.ok){ window.location = d.redirect || "/"; }
+              else { alert(d.error || "Kirishda xatolik"); }
+            }).catch(function(){ alert("Tarmoq xatosi. Qayta urinib ko'ring."); });
+          }
+        </script>
+      {% else %}
+        <div style="padding:14px;background:var(--bg2);border:1px dashed var(--gold);border-radius:12px;color:var(--gold-soft);font-size:.9rem">
+          Google kirish hali sozlanmagan. Admin <code>GOOGLE_CLIENT_ID</code> ni Railway
+          Variables bo'limiga qo'shishi kerak. Vaqtincha pastdagi admin kirishidan foydalaning.
+        </div>
+      {% endif %}
+
+      <details class="admin-fallback">
+        <summary>Admin sifatida parol bilan kirish</summary>
+        <form method="post" style="margin-top:12px">
+          <label>Login</label><input name="username" autocomplete="username">
+          <label>Parol</label><input type="password" name="password" autocomplete="current-password">
+          <button class="btn btn-ghost" style="width:100%;margin-top:16px">Kirish</button>
+        </form>
+      </details>
     </div>
     """
     return render(tpl, title="Kirish")
@@ -902,9 +1163,6 @@ def logout():
 def profile():
     db = get_db()
     u = current_user()
-    txs = db.execute(
-        "SELECT * FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT 20",
-        (u["id"],)).fetchall()
     unlocked = db.execute("""
         SELECT c.number, m.title, m.slug, c.id AS cid FROM purchases p
         JOIN chapters c ON c.id=p.chapter_id JOIN manga m ON m.id=c.manga_id
@@ -914,10 +1172,14 @@ def profile():
       <div class="sec-head"><div><span class="eyebrow">Hisob</span><h2>{{ user['username'] }}</h2></div></div>
       <div class="panel">
         <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px">
-          <div>
-            <div style="color:var(--muted);font-size:.85rem">Sizning ID raqamingiz</div>
-            <div style="margin-top:6px"><span class="pageid">ID: {{ user['id'] }}</span></div>
-            <div style="color:var(--muted);font-size:.82rem;margin-top:8px">Tanga sotib olishda adminga shu ID ni yuboring.</div>
+          <div style="display:flex;gap:14px;align-items:center">
+            {% if user['avatar'] %}<img class="avatar" style="width:56px;height:56px" src="{{ user['avatar'] }}" alt="">{% endif %}
+            <div>
+              <div style="color:var(--muted);font-size:.85rem">Sizning ID raqamingiz</div>
+              <div style="margin-top:6px"><span class="pageid">ID: {{ user['id'] }}</span></div>
+              {% if user['email'] %}<div style="color:var(--muted);font-size:.82rem;margin-top:8px">{{ user['email'] }}</div>{% endif %}
+              <div style="color:var(--muted);font-size:.82rem;margin-top:6px">Tanga olishda adminga shu ID ni yuboring.</div>
+            </div>
           </div>
           <div style="text-align:right">
             <div style="color:var(--muted);font-size:.85rem">Balans</div>
@@ -926,9 +1188,27 @@ def profile():
           </div>
         </div>
       </div>
+
+      <div class="panel" style="margin-top:18px">
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          {% if user['is_admin'] %}<a href="{{ url_for('admin') }}" class="btn btn-ghost" style="flex:1;min-width:140px">🛠 Admin panel</a>{% endif %}
+          <a href="{{ url_for('logout') }}" class="btn btn-ghost" style="flex:1;min-width:140px">Chiqish</a>
+        </div>
+      </div>
+
+      {% if unlocked %}
+      <div class="panel" style="margin-top:18px">
+        <h3>Ochilgan boblar</h3>
+        <table><tr><th>Manga</th><th>Bob</th></tr>
+        {% for r in unlocked %}<tr>
+          <td><a href="{{ url_for('manga_detail', slug=r['slug']) }}" style="color:var(--gold)">{{ r['title'] }}</a></td>
+          <td>{{ r['number']|int }}-bob</td>
+        </tr>{% endfor %}</table>
+      </div>
+      {% endif %}
     </div></section>
     """
-    return render(tpl, txs=txs, unlocked=unlocked, title="Profil")
+    return render(tpl, unlocked=unlocked, title="Profil")
 
 
 # ----------------------------------------------------------- TANGA SOTIB OLISH
@@ -945,7 +1225,7 @@ def coins():
           <li>Quyidagi <strong style="color:var(--gold)">Telegram admin</strong> tugmasini bosing.</li>
           <li>Kerakli tanga paketini tanlab, adminga to'lovni amalga oshiring.</li>
           {% if user %}<li>Adminga o'z <strong style="color:var(--gold)">ID: {{ user['id'] }}</strong> raqamingizni yuboring.</li>
-          {% else %}<li>Avval <a href="{{ url_for('register') }}" style="color:var(--gold)">ro'yxatdan o'teb qo'ying</a> — sizga ID beriladi.</li>{% endif %}
+          {% else %}<li>Avval <a href="{{ url_for('login') }}" style="color:var(--gold)">Google orqali kiring</a> — sizga ID beriladi.</li>{% endif %}
           <li>Admin pulni qabul qilgach, tangalar balansingizga tushadi.</li>
         </ol>
 
@@ -1011,8 +1291,8 @@ def admin():
           <p style="color:var(--muted);font-size:.9rem">Yangi manga/manhwa qo'shing.</p>
         </a>
         <a href="{{ url_for('admin_add_chapter') }}" class="panel" style="display:block">
-          <h3>+ Bob qo'shish</h3>
-          <p style="color:var(--muted);font-size:.9rem">Mavjud mangaga bob va rasmlar yuklang.</p>
+          <h3>+ Bob qo'shish (PDF)</h3>
+          <p style="color:var(--muted);font-size:.9rem">Bitta PDF yuklang — sahifalarga o'zi bo'linadi.</p>
         </a>
         <a href="{{ url_for('admin_users') }}" class="panel" style="display:block">
           <h3>👥 Foydalanuvchilar</h3>
@@ -1067,7 +1347,7 @@ def admin_add_coins():
     admin_u = current_user()
     found = None
     uid_q = request.args.get("uid") or request.form.get("uid")
-    if uid_q and uid_q.isdigit():
+    if uid_q and str(uid_q).isdigit():
         found = db.execute("SELECT * FROM users WHERE id=?", (int(uid_q),)).fetchone()
 
     if request.method == "POST" and request.form.get("action") == "add":
@@ -1144,10 +1424,11 @@ def admin_users():
       <div class="sec-head"><div><span class="eyebrow">Admin</span><h2>Foydalanuvchilar</h2></div>
         <a href="{{ url_for('admin') }}">← Panelga</a></div>
       <div class="panel">
-        <table><tr><th>ID</th><th>Login</th><th>Tanga</th><th>Rol</th><th></th></tr>
+        <table><tr><th>ID</th><th>Login</th><th>Email</th><th>Tanga</th><th>Rol</th><th></th></tr>
         {% for u in users %}<tr>
           <td><span class="pageid">{{ u['id'] }}</span></td>
           <td>{{ u['username'] }}</td>
+          <td style="color:var(--muted)">{{ u['email'] or '—' }}</td>
           <td style="color:var(--gold);font-weight:700">◉ {{ u['coins'] }}</td>
           <td>{{ 'Admin' if u['is_admin'] else 'Foydalanuvchi' }}</td>
           <td><a href="{{ url_for('admin_add_coins', uid=u['id']) }}" class="btn btn-ghost" style="padding:6px 12px">Tanga qo'shish</a></td>
@@ -1228,39 +1509,63 @@ def admin_add_chapter():
         is_premium = 1 if request.form.get("is_premium") else 0
         coin_cost = request.form.get("coin_cost", "0")
         page_urls = request.form.get("page_urls", "").strip()
-        files = request.files.getlist("page_files")
+        image_files = request.files.getlist("page_files")
+        pdf_file = request.files.get("pdf_file")
 
         if not manga_id.isdigit():
             flash("Manga tanlang.", "err")
-        else:
-            try:
-                number = float(number)
-            except ValueError:
-                flash("Bob raqamini to'g'ri kiriting.", "err")
-                return redirect(url_for("admin_add_chapter"))
-            cost = int(coin_cost) if coin_cost.isdigit() and is_premium else 0
-            db.execute(
-                "INSERT INTO chapters (manga_id, number, title, is_premium, coin_cost, created_at) "
-                "VALUES (?,?,?,?,?,?)",
-                (int(manga_id), number, ctitle, is_premium, cost, now()))
-            cid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-            pg = 0
-            for f in files:
-                url = save_upload(f)
-                if url:
-                    pg += 1
-                    db.execute("INSERT INTO pages (chapter_id, page_number, image) VALUES (?,?,?)",
-                               (cid, pg, url))
-            for line in page_urls.splitlines():
-                line = line.strip()
-                if line:
-                    pg += 1
-                    db.execute("INSERT INTO pages (chapter_id, page_number, image) VALUES (?,?,?)",
-                               (cid, pg, line))
-            db.commit()
-            flash(f"✓ Bob qo'shildi ({pg} ta sahifa).", "ok")
             return redirect(url_for("admin_add_chapter"))
+
+        try:
+            number = float(number)
+        except ValueError:
+            flash("Bob raqamini to'g'ri kiriting.", "err")
+            return redirect(url_for("admin_add_chapter"))
+
+        # 1) Avval PDF ni sahifalarga aylantiramiz (asosiy usul)
+        pdf_urls, pdf_err = pdf_to_page_urls(pdf_file)
+        if pdf_err:
+            flash(pdf_err, "err")
+            return redirect(url_for("admin_add_chapter"))
+
+        cost = int(coin_cost) if coin_cost.isdigit() and is_premium else 0
+        db.execute(
+            "INSERT INTO chapters (manga_id, number, title, is_premium, coin_cost, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (int(manga_id), number, ctitle, is_premium, cost, now()))
+        cid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        pg = 0
+        # PDF sahifalari
+        for url in (pdf_urls or []):
+            pg += 1
+            db.execute("INSERT INTO pages (chapter_id, page_number, image) VALUES (?,?,?)",
+                       (cid, pg, url))
+        # Qo'shimcha: alohida rasm fayllari (ixtiyoriy)
+        for f in image_files:
+            url = save_upload(f)
+            if url:
+                pg += 1
+                db.execute("INSERT INTO pages (chapter_id, page_number, image) VALUES (?,?,?)",
+                           (cid, pg, url))
+        # Qo'shimcha: URL lar (ixtiyoriy)
+        for line in page_urls.splitlines():
+            line = line.strip()
+            if line:
+                pg += 1
+                db.execute("INSERT INTO pages (chapter_id, page_number, image) VALUES (?,?,?)",
+                           (cid, pg, line))
+
+        if pg == 0:
+            # Bo'sh bob — hech narsa yuklanmagan
+            db.execute("DELETE FROM chapters WHERE id=?", (cid,))
+            db.commit()
+            flash("Hech qanday sahifa yuklanmadi. PDF yoki rasm qo'shing.", "err")
+            return redirect(url_for("admin_add_chapter"))
+
+        db.commit()
+        flash(f"✓ Bob qo'shildi ({pg} ta sahifa).", "ok")
+        return redirect(url_for("admin_add_chapter"))
 
     tpl = """
     <section class="section"><div class="container" style="max-width:640px">
@@ -1283,10 +1588,21 @@ def admin_add_chapter():
           </div>
           <div class="check"><input type="checkbox" name="is_premium" id="prem"><label for="prem" style="margin:0">Premium bob (tanga evaziga)</label></div>
           <label>Narxi (tanga) — premium bo'lsa</label><input name="coin_cost" type="number" value="0">
-          <label>Sahifa rasmlarini yuklash (bir nechta tanlash mumkin)</label>
-          <input type="file" name="page_files" accept="image/*" multiple>
-          <label>yoki rasm URL lari (har qatorga bittadan)</label>
-          <textarea name="page_urls" placeholder="https://.../1.jpg&#10;https://.../2.jpg"></textarea>
+
+          <div style="margin-top:20px;padding:16px;background:var(--bg2);border:1px dashed var(--gold);border-radius:12px">
+            <label style="margin-top:0;color:var(--gold-soft)">📄 PDF fayl yuklash (tavsiya etiladi)</label>
+            <input type="file" name="pdf_file" accept="application/pdf">
+            <div class="hint">Butun bobni bitta PDF qilib yuklang — har bir sahifa avtomatik ajratiladi.</div>
+          </div>
+
+          <details style="margin-top:14px">
+            <summary style="cursor:pointer;color:var(--muted);font-size:.86rem;font-weight:600">Yoki rasm/URL bilan yuklash (ixtiyoriy)</summary>
+            <label>Sahifa rasmlari (bir nechta tanlash mumkin)</label>
+            <input type="file" name="page_files" accept="image/*" multiple>
+            <label>yoki rasm URL lari (har qatorga bittadan)</label>
+            <textarea name="page_urls" placeholder="https://.../1.jpg&#10;https://.../2.jpg"></textarea>
+          </details>
+
           <button class="btn btn-primary" style="width:100%;margin-top:20px">Bobni saqlash</button>
         </form>
       </div>
@@ -1310,13 +1626,14 @@ def e404(e):
 
 
 # ===================================================================== ISHGA TUSHISH
+# Gunicorn ham, "python app.py" ham ishlashi uchun bazani import paytida tayyorlaymiz.
+init_db()
+
 if __name__ == "__main__":
-    init_db()
-    # Railway muhitiga portni dinamik moslash
     port = int(os.environ.get("PORT", 5000))
     print("=" * 60)
     print(f"  {SITE_NAME} ishga tushdi:  http://0.0.0.0:{port}")
-    print(f"  Admin:  login={ADMIN_LOGIN}  parol={ADMIN_PASSWORD}")
+    print(f"  Zaxira admin:  login={ADMIN_LOGIN}  parol={ADMIN_PASSWORD}")
+    print(f"  Google kirish: {'YOQILGAN' if GOOGLE_CLIENT_ID else 'sozlanmagan'}")
     print("=" * 60)
-    # Production muhitda debug=False bo'lgani ma'qul
     app.run(debug=False, host="0.0.0.0", port=port)
