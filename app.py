@@ -5,9 +5,17 @@
 ==========================================================================
   Texnologiya : Python + Flask + SQLite
   PDF -> sahifa : PyMuPDF (requirements.txt ga qo'shilgan)
-  Kirish       : Google orqali (parolsiz) + admin uchun zaxira parol
+  Kirish       : Telefon raqam + Telegram bot orqali kod (parolsiz)
+                 + admin uchun zaxira parol
   Muallif      : Ayubxon (ANIMAN)
   Railway (2026) uchun moslashtirilgan
+==========================================================================
+  SOZLASH (Railway "Variables"):
+    TELEGRAM_BOT_TOKEN    -> @BotFather dan olingan bot tokeni
+    TELEGRAM_BOT_USERNAME -> bot useri (@ belgisisiz, masalan: manga_olami_bot)
+    ADMIN_PHONE           -> admin telefon raqami (masalan: 998901234567)
+  Deploy qilingandan keyin zaxira admin bilan kirib, bir marta
+  /tg/set-webhook sahifasini oching — bot ishga tushadi.
 ==========================================================================
 """
 
@@ -15,9 +23,10 @@ import os
 import json
 import sqlite3
 import secrets
+import hashlib
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 
 from flask import (
@@ -31,15 +40,20 @@ SITE_NAME = "Manga olami"
 TELEGRAM_ADMIN = "https://t.me/animan_only"
 COIN_NAME = "tanga"
 
-# Zaxira admin (Google sozlanmagan bo'lsa ham kira olishingiz uchun)
+# Zaxira admin (bot sozlanmagan bo'lsa ham kira olishingiz uchun)
 ADMIN_LOGIN = os.environ.get("ADMIN_LOGIN", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 
-# --- GOOGLE KIRISH SOZLAMALARI (Railway "Variables" bo'limiga qo'ying) ---
-#   GOOGLE_CLIENT_ID  -> Google Cloud Console'dan olingan "Web client" ID
-#   ADMIN_EMAIL       -> Qaysi Google email admin bo'lishini yozing (masalan siznikini)
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
-ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "").strip().lower()
+# --- TELEGRAM ORQALI KIRISH SOZLAMALARI ---
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@")
+ADMIN_PHONE = os.environ.get("ADMIN_PHONE", "").strip()
+
+# Webhook uchun maxfiy yo'l (token asosida)
+TG_SECRET = hashlib.sha256((TELEGRAM_BOT_TOKEN or "no-token").encode()).hexdigest()[:24]
+
+CODE_TTL_MINUTES = 5      # kod amal qilish vaqti
+CODE_MAX_ATTEMPTS = 5     # nechta marta xato kiritish mumkin
 
 ALLOWED_EXT = {"png", "jpg", "jpeg", "webp", "gif"}
 
@@ -55,6 +69,11 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "manga-olami-super-secret-key-12345")
 _max_mb = int(os.environ.get("MAX_UPLOAD_MB", "128"))
 app.config["MAX_CONTENT_LENGTH"] = _max_mb * 1024 * 1024
+
+# Sessiya uzoq saqlanadi — foydalanuvchi "Chiqish" bosmaguncha akkaunt turadi
+app.permanent_session_lifetime = timedelta(days=365)
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_HTTPONLY"] = True
 
 
 # ============================================================ MA'LUMOTLAR BAZASI
@@ -82,7 +101,8 @@ def ensure_columns(db):
     have = {r[1] for r in db.execute("PRAGMA table_info(users)").fetchall()}
     for col, ddl in (("email", "email TEXT"),
                      ("google_id", "google_id TEXT"),
-                     ("avatar", "avatar TEXT")):
+                     ("avatar", "avatar TEXT"),
+                     ("phone", "phone TEXT")):
         if col not in have:
             db.execute(f"ALTER TABLE users ADD COLUMN {ddl}")
 
@@ -98,6 +118,7 @@ def init_db():
             email        TEXT,
             google_id    TEXT,
             avatar       TEXT,
+            phone        TEXT,
             coins        INTEGER DEFAULT 0,
             is_admin     INTEGER DEFAULT 0,
             created_at   TEXT
@@ -157,6 +178,22 @@ def init_db():
             user_id      INTEGER NOT NULL,
             manga_id     INTEGER NOT NULL,
             UNIQUE(user_id, manga_id)
+        );
+
+        -- Telegram bot bilan bog'langan telefon raqamlar
+        CREATE TABLE IF NOT EXISTS tg_links (
+            phone        TEXT PRIMARY KEY,
+            chat_id      INTEGER NOT NULL,
+            created_at   TEXT
+        );
+
+        -- Kirish kodlari
+        CREATE TABLE IF NOT EXISTS login_codes (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone        TEXT NOT NULL,
+            code         TEXT NOT NULL,
+            expires_at   TEXT NOT NULL,
+            attempts     INTEGER DEFAULT 0
         );
         """
     )
@@ -232,6 +269,12 @@ def current_user():
     if not uid:
         return None
     return get_db().execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+
+
+def do_login(uid):
+    """Foydalanuvchini kiritish — sessiya 'Chiqish' bosilmaguncha saqlanadi."""
+    session.permanent = True
+    session["uid"] = uid
 
 
 def login_required(f):
@@ -314,82 +357,364 @@ def inject_globals():
     return dict(
         SITE_NAME=SITE_NAME, COIN_NAME=COIN_NAME,
         TELEGRAM_ADMIN=TELEGRAM_ADMIN, user=current_user(),
-        GOOGLE_CLIENT_ID=GOOGLE_CLIENT_ID, GOOGLE_ENABLED=bool(GOOGLE_CLIENT_ID),
+        BOT_USERNAME=TELEGRAM_BOT_USERNAME,
+        BOT_ENABLED=bool(TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_USERNAME),
     )
 
 
-# ============================================================ GOOGLE KIRISH
+# ============================================================ TELEGRAM KIRISH
+def normalize_phone(raw):
+    """Telefon raqamni 998901234567 ko'rinishiga keltiradi."""
+    d = "".join(ch for ch in (raw or "") if ch.isdigit())
+    if len(d) == 9:                      # 901234567
+        d = "998" + d
+    if len(d) == 12 and d.startswith("998"):
+        return d
+    return None
+
+
+def tg_api(method, payload):
+    """Telegram Bot API ga so'rov yuboradi."""
+    if not TELEGRAM_BOT_TOKEN:
+        return None
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
 def _unique_username(base):
     db = get_db()
-    base = "".join(ch for ch in (base or "") if ch.isalnum() or ch in " _-").strip()
-    base = (base or "user")[:20]
+    base = "".join(ch for ch in (base or "") if ch.isalnum() or ch in " _-'").strip()
+    base = (base or "user")[:30]
     uname = base
     i = 1
     while db.execute("SELECT 1 FROM users WHERE username=?", (uname,)).fetchone():
         i += 1
-        uname = f"{base}{i}"
+        uname = f"{base} {i}"
     return uname
 
 
-def verify_google_token(credential):
-    """Google ID tokenni tokeninfo endpoint orqali tekshiradi."""
-    if not credential:
-        return None
-    url = "https://oauth2.googleapis.com/tokeninfo?" + urllib.parse.urlencode(
-        {"id_token": credential})
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "manga-olami"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read().decode("utf-8"))
-    except Exception:
-        return None
-    if GOOGLE_CLIENT_ID and data.get("aud") != GOOGLE_CLIENT_ID:
-        return None
-    if not data.get("sub"):
-        return None
-    return data
+@app.route(f"/tg/webhook/{TG_SECRET}", methods=["POST"])
+def tg_webhook():
+    """Telegram botdan keladigan xabarlar (kontakt / start)."""
+    upd = request.get_json(silent=True) or {}
+    msg = upd.get("message") or {}
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    if not chat_id:
+        return jsonify(ok=True)
+
+    contact = msg.get("contact")
+    text = (msg.get("text") or "").strip()
+    db = get_db()
+
+    if contact and contact.get("phone_number"):
+        # Faqat o'zining kontakti qabul qilinadi
+        if contact.get("user_id") and contact["user_id"] != (msg.get("from") or {}).get("id"):
+            tg_api("sendMessage", {"chat_id": chat_id,
+                                   "text": "Iltimos, faqat o'zingizning raqamingizni yuboring."})
+            return jsonify(ok=True)
+        phone = normalize_phone(contact["phone_number"])
+        if phone:
+            db.execute(
+                "INSERT INTO tg_links (phone, chat_id, created_at) VALUES (?,?,?) "
+                "ON CONFLICT(phone) DO UPDATE SET chat_id=excluded.chat_id",
+                (phone, chat_id, now()))
+            db.commit()
+            tg_api("sendMessage", {
+                "chat_id": chat_id,
+                "text": ("✅ Raqamingiz muvaffaqiyatli bog'landi!\n\n"
+                         "Endi saytga qaytib, shu raqamni kiriting — "
+                         "kirish kodi shu yerga keladi."),
+                "reply_markup": {"remove_keyboard": True}})
+        else:
+            tg_api("sendMessage", {"chat_id": chat_id,
+                                   "text": "Raqam formati noto'g'ri ko'rinadi."})
+    elif text.startswith("/start"):
+        tg_api("sendMessage", {
+            "chat_id": chat_id,
+            "text": (f"Assalomu alaykum! 👋\n\n{SITE_NAME} saytiga kirish uchun "
+                     "pastdagi tugma orqali telefon raqamingizni yuboring 👇"),
+            "reply_markup": {
+                "keyboard": [[{"text": "📱 Raqamni yuborish", "request_contact": True}]],
+                "resize_keyboard": True,
+                "one_time_keyboard": True}})
+    return jsonify(ok=True)
 
 
-@app.route("/auth/google", methods=["POST"])
-def auth_google():
-    credential = request.form.get("credential", "")
-    if not GOOGLE_CLIENT_ID:
-        return jsonify(ok=False, error="Google kirish sozlanmagan (GOOGLE_CLIENT_ID yo'q).")
-    info = verify_google_token(credential)
-    if not info:
-        return jsonify(ok=False, error="Google token tekshiruvdan o'tmadi.")
+@app.route("/tg/set-webhook")
+@admin_required
+def tg_set_webhook():
+    """Bir marta ochiladi — Telegram webhookni ulaydi."""
+    if not TELEGRAM_BOT_TOKEN:
+        flash("TELEGRAM_BOT_TOKEN sozlanmagan (Railway Variables).", "err")
+        return redirect(url_for("admin"))
+    base = request.url_root.rstrip("/")
+    if base.startswith("http://"):
+        base = "https://" + base[len("http://"):]
+    hook = f"{base}/tg/webhook/{TG_SECRET}"
+    res = tg_api("setWebhook", {"url": hook})
+    if res and res.get("ok"):
+        flash("✓ Telegram bot muvaffaqiyatli ulandi.", "ok")
+    else:
+        flash(f"Webhook o'rnatishda xatolik: {res}", "err")
+    return redirect(url_for("admin"))
+
+
+def send_login_code(phone):
+    """Kod yaratadi va Telegramga yuboradi. (ok, error) qaytaradi."""
+    db = get_db()
+    link = db.execute("SELECT * FROM tg_links WHERE phone=?", (phone,)).fetchone()
+    if not link:
+        return False, "not_linked"
+    code = f"{secrets.randbelow(900000) + 100000}"
+    expires = (datetime.now() + timedelta(minutes=CODE_TTL_MINUTES)) \
+        .strftime("%Y-%m-%d %H:%M:%S")
+    db.execute("DELETE FROM login_codes WHERE phone=?", (phone,))
+    db.execute("INSERT INTO login_codes (phone, code, expires_at) VALUES (?,?,?)",
+               (phone, code, expires))
+    db.commit()
+    res = tg_api("sendMessage", {
+        "chat_id": link["chat_id"],
+        "text": (f"🔐 {SITE_NAME} — kirish kodingiz:\n\n"
+                 f"{code}\n\n"
+                 f"Kod {CODE_TTL_MINUTES} daqiqa amal qiladi. "
+                 "Uni hech kimga bermang!")})
+    if not res or not res.get("ok"):
+        return False, "send_failed"
+    return True, None
+
+
+# ----------------------------------------------------------------- AUTH
+@app.route("/register")
+def register():
+    return redirect(url_for("login"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if current_user():
+        return redirect(url_for("index"))
+
+    show_bot_help = False
+    phone_val = ""
+
+    if request.method == "POST":
+        form_type = request.form.get("form", "phone")
+
+        # --- Zaxira admin (login/parol) ---
+        if form_type == "admin":
+            username = request.form.get("username", "").strip()
+            pw = request.form.get("password", "")
+            u = get_db().execute(
+                "SELECT * FROM users WHERE username=?", (username,)).fetchone()
+            if u and u["password"] and check_password_hash(u["password"], pw):
+                do_login(u["id"])
+                flash("Tizimga kirdingiz.", "ok")
+                nxt = request.args.get("next")
+                return redirect(nxt or url_for("index"))
+            flash("Login yoki parol xato.", "err")
+
+        # --- Telefon raqam bilan kirish ---
+        else:
+            phone_val = request.form.get("phone", "").strip()
+            phone = normalize_phone(phone_val)
+            if not phone:
+                flash("Telefon raqamni to'g'ri kiriting. Masalan: 90 123 45 67", "err")
+            elif not TELEGRAM_BOT_TOKEN:
+                flash("Telegram bot hali sozlanmagan. Admin bilan bog'laning.", "err")
+            else:
+                ok, err = send_login_code(phone)
+                if ok:
+                    session["pending_phone"] = phone
+                    nxt = request.args.get("next")
+                    return redirect(url_for("verify", next=nxt) if nxt
+                                    else url_for("verify"))
+                if err == "not_linked":
+                    show_bot_help = True
+                    flash("Bu raqam hali botga ulanmagan. Avval 1-qadamni bajaring.", "warn")
+                else:
+                    flash("Kod yuborishda xatolik. Botga /start yozib, qayta urining.", "err")
+
+    tpl = """
+    <div class="form-wrap panel fade">
+      <h3>Telefon raqam bilan kirish</h3>
+
+      {% if BOT_ENABLED %}
+      <div style="margin:14px 0;padding:14px;background:var(--bg2);border:1px solid var(--border);border-radius:12px">
+        <div style="font-weight:700;margin-bottom:8px">1-qadam <span style="color:var(--muted);font-weight:500">(faqat birinchi marta)</span></div>
+        <p style="color:var(--muted);font-size:.9rem;margin-bottom:12px">
+          Telegram botimizga kirib, <strong>«📱 Raqamni yuborish»</strong> tugmasini bosing.</p>
+        <a href="https://t.me/{{ BOT_USERNAME }}" target="_blank" class="btn btn-tg" style="width:100%">✈ @{{ BOT_USERNAME }} botni ochish</a>
+      </div>
+
+      <div style="margin:14px 0;padding:14px;background:var(--bg2);border:1px solid {{ 'var(--gold)' if show_bot_help else 'var(--border)' }};border-radius:12px">
+        <div style="font-weight:700;margin-bottom:8px">2-qadam</div>
+        <p style="color:var(--muted);font-size:.9rem;margin-bottom:6px">
+          Telefon raqamingizni kiriting — kirish kodi Telegramingizga boradi.</p>
+        <form method="post">
+          <input type="hidden" name="form" value="phone">
+          <label>Telefon raqam</label>
+          <div style="display:flex;gap:8px;align-items:center">
+            <span style="padding:12px 12px;background:var(--bg2);border:1px solid var(--border);border-radius:11px;color:var(--muted);white-space:nowrap">+998</span>
+            <input name="phone" value="{{ phone_val }}" inputmode="tel" autocomplete="tel"
+                   placeholder="90 123 45 67" required style="flex:1">
+          </div>
+          <button class="btn btn-primary" style="width:100%;margin-top:16px">Kod yuborish</button>
+        </form>
+      </div>
+      {% else %}
+        <div style="padding:14px;background:var(--bg2);border:1px dashed var(--gold);border-radius:12px;color:var(--gold-soft);font-size:.9rem">
+          Telegram orqali kirish hali sozlanmagan. Admin <code>TELEGRAM_BOT_TOKEN</code> va
+          <code>TELEGRAM_BOT_USERNAME</code> ni Railway Variables bo'limiga qo'shishi kerak.
+          Vaqtincha pastdagi admin kirishidan foydalaning.
+        </div>
+      {% endif %}
+
+      <details class="admin-fallback">
+        <summary>Admin sifatida parol bilan kirish</summary>
+        <form method="post" style="margin-top:12px">
+          <input type="hidden" name="form" value="admin">
+          <label>Login</label><input name="username" autocomplete="username">
+          <label>Parol</label><input type="password" name="password" autocomplete="current-password">
+          <button class="btn btn-ghost" style="width:100%;margin-top:16px">Kirish</button>
+        </form>
+      </details>
+    </div>
+    """
+    return render(tpl, show_bot_help=show_bot_help, phone_val=phone_val,
+                  title="Kirish")
+
+
+@app.route("/verify", methods=["GET", "POST"])
+def verify():
+    if current_user():
+        return redirect(url_for("index"))
+    phone = session.get("pending_phone")
+    if not phone:
+        return redirect(url_for("login"))
 
     db = get_db()
-    email = (info.get("email") or "").strip().lower()
-    sub = info.get("sub")
-    name = info.get("name") or (email.split("@")[0] if email else "user")
-    avatar = info.get("picture") or ""
-    is_admin_flag = 1 if (ADMIN_EMAIL and email == ADMIN_EMAIL) else 0
 
-    # Avval google_id, keyin email bo'yicha qidiramiz -> bir xil akkaunt qaytadi
-    u = db.execute("SELECT * FROM users WHERE google_id=?", (sub,)).fetchone()
-    if not u and email:
-        u = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    if request.method == "POST":
+        entered = "".join(ch for ch in request.form.get("code", "") if ch.isdigit())
+        row = db.execute(
+            "SELECT * FROM login_codes WHERE phone=? ORDER BY id DESC LIMIT 1",
+            (phone,)).fetchone()
+        if not row or row["expires_at"] < now():
+            flash("Kod muddati tugagan. Yangi kod oling.", "err")
+            return redirect(url_for("login"))
+        if row["attempts"] >= CODE_MAX_ATTEMPTS:
+            db.execute("DELETE FROM login_codes WHERE id=?", (row["id"],))
+            db.commit()
+            flash("Juda ko'p xato urinish. Yangi kod oling.", "err")
+            return redirect(url_for("login"))
+        if entered != row["code"]:
+            db.execute("UPDATE login_codes SET attempts=attempts+1 WHERE id=?",
+                       (row["id"],))
+            db.commit()
+            flash("Kod noto'g'ri. Qayta urinib ko'ring.", "err")
+        else:
+            # Kod to'g'ri
+            db.execute("DELETE FROM login_codes WHERE phone=?", (phone,))
+            db.commit()
+            u = db.execute("SELECT * FROM users WHERE phone=?", (phone,)).fetchone()
+            if u:
+                # Eski akkaunt — o'sha akkauntga kiradi
+                if ADMIN_PHONE and normalize_phone(ADMIN_PHONE) == phone and not u["is_admin"]:
+                    db.execute("UPDATE users SET is_admin=1 WHERE id=?", (u["id"],))
+                    db.commit()
+                session.pop("pending_phone", None)
+                do_login(u["id"])
+                flash(f"Xush kelibsiz, {u['username']}!", "ok")
+                nxt = request.args.get("next")
+                return redirect(nxt or url_for("index"))
+            # Yangi foydalanuvchi — ism-familiya so'raymiz
+            session["verified_phone"] = phone
+            session.pop("pending_phone", None)
+            nxt = request.args.get("next")
+            return redirect(url_for("complete_signup", next=nxt) if nxt
+                            else url_for("complete_signup"))
 
-    if u:
-        db.execute("UPDATE users SET google_id=?, email=?, avatar=? WHERE id=?",
-                   (sub, email, avatar, u["id"]))
-        if is_admin_flag:
-            db.execute("UPDATE users SET is_admin=1 WHERE id=?", (u["id"],))
-        db.commit()
-        uid = u["id"]
-    else:
-        username = _unique_username(name)
-        db.execute(
-            "INSERT INTO users (username, password, email, google_id, avatar, "
-            "coins, is_admin, created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (username, "", email, sub, avatar, 0, is_admin_flag, now()))
-        db.commit()
-        uid = db.execute("SELECT id FROM users WHERE google_id=?", (sub,)).fetchone()["id"]
+    masked = phone[:5] + "•••" + phone[-2:]
+    tpl = """
+    <div class="form-wrap panel fade">
+      <h3>Kodni kiriting</h3>
+      <p style="color:var(--muted);font-size:.92rem;margin-bottom:6px">
+        <strong>+{{ masked }}</strong> raqamiga bog'langan Telegramga 6 xonali kod yubordik.</p>
+      <form method="post">
+        <label>Kirish kodi</label>
+        <input name="code" inputmode="numeric" autocomplete="one-time-code"
+               maxlength="6" placeholder="••••••" required autofocus
+               style="text-align:center;font-size:1.4rem;letter-spacing:.4em;font-weight:700">
+        <button class="btn btn-primary" style="width:100%;margin-top:18px">Tasdiqlash</button>
+      </form>
+      <a href="{{ url_for('login') }}" style="display:block;margin-top:16px;text-align:center;color:var(--muted);font-size:.88rem">← Boshqa raqam / yangi kod olish</a>
+    </div>
+    """
+    return render(tpl, masked=masked, title="Kodni tasdiqlash")
 
-    session["uid"] = uid
-    nxt = request.args.get("next") or request.form.get("next")
-    return jsonify(ok=True, redirect=(nxt or url_for("index")))
+
+@app.route("/complete", methods=["GET", "POST"])
+def complete_signup():
+    if current_user():
+        return redirect(url_for("index"))
+    phone = session.get("verified_phone")
+    if not phone:
+        return redirect(url_for("login"))
+
+    if request.method == "POST":
+        first = request.form.get("first_name", "").strip()
+        last = request.form.get("last_name", "").strip()
+        if not first:
+            flash("Ismingizni kiriting.", "err")
+        else:
+            db = get_db()
+            # Xavfsizlik: shu orada akkaunt paydo bo'lgan bo'lsa — o'shanga kiramiz
+            u = db.execute("SELECT * FROM users WHERE phone=?", (phone,)).fetchone()
+            if not u:
+                full = (first + (" " + last if last else "")).strip()
+                username = _unique_username(full)
+                is_admin_flag = 1 if (ADMIN_PHONE and
+                                      normalize_phone(ADMIN_PHONE) == phone) else 0
+                db.execute(
+                    "INSERT INTO users (username, password, phone, coins, is_admin, "
+                    "created_at) VALUES (?,?,?,?,?,?)",
+                    (username, "", phone, 0, is_admin_flag, now()))
+                db.commit()
+                u = db.execute("SELECT * FROM users WHERE phone=?", (phone,)).fetchone()
+            session.pop("verified_phone", None)
+            do_login(u["id"])
+            flash(f"Akkaunt yaratildi. Xush kelibsiz, {u['username']}!", "ok")
+            nxt = request.args.get("next")
+            return redirect(nxt or url_for("index"))
+
+    tpl = """
+    <div class="form-wrap panel fade">
+      <h3>Oxirgi qadam 🎉</h3>
+      <p style="color:var(--muted);font-size:.92rem;margin-bottom:6px">
+        Raqamingiz tasdiqlandi. Endi ism va familiyangizni kiriting.</p>
+      <form method="post">
+        <label>Ism *</label><input name="first_name" required autofocus autocomplete="given-name">
+        <label>Familiya</label><input name="last_name" autocomplete="family-name">
+        <button class="btn btn-primary" style="width:100%;margin-top:18px">Akkaunt ochish</button>
+      </form>
+    </div>
+    """
+    return render(tpl, title="Ro'yxatdan o'tish")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    flash("Tizimdan chiqdingiz.", "ok")
+    return redirect(url_for("index"))
 
 
 # ================================================================= DIZAYN / CSS
@@ -541,7 +866,6 @@ details.admin-fallback{margin-top:22px;border-top:1px solid var(--border);paddin
 details.admin-fallback summary{cursor:pointer;color:var(--muted);font-size:.86rem;
   font-weight:600;list-style:none}
 details.admin-fallback summary::-webkit-details-marker{display:none}
-.gbtn-wrap{display:flex;justify-content:center;margin:10px 0 4px;min-height:44px}
 
 /* ---- Reader ---- */
 .reader{max-width:820px;margin:0 auto;padding:20px}
@@ -646,6 +970,67 @@ footer{border-top:1px solid var(--border);margin-top:50px;padding:36px 0;color:v
 
   /* Kontent pastki menyu ostida qolib ketmasligi uchun */
   body{padding-bottom:calc(66px + env(safe-area-inset-bottom))}
+
+  /* ======== TELEFON = MOBIL ILOVA KO'RINISHI ======== */
+
+  /* Footer telefonda ko'rinmaydi — ilovaga o'xshash */
+  footer{display:none}
+
+  /* Yuqori panel — ixcham ilova sarlavhasi */
+  .nav{background:rgba(11,9,24,.94)}
+  .nav-right .btn-ghost{padding:7px 12px;font-size:.85rem}
+
+  /* Mashhur asarlar — gorizontal surish (app-style carousel) */
+  .h-scroll{display:flex;overflow-x:auto;gap:12px;
+    scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch;
+    margin:0 -20px;padding:2px 20px 8px;scrollbar-width:none}
+  .h-scroll::-webkit-scrollbar{display:none}
+  .h-scroll .card{flex:0 0 150px;min-width:150px;scroll-snap-align:start}
+  .h-scroll .card .title{font-size:.86rem}
+
+  /* Hero — ixcham banner */
+  .hero h1{font-size:1.75rem}
+  .hero-stats .s .n{font-size:1.25rem}
+  .hero .cta .btn{flex:1;padding:11px 14px}
+
+  /* Manga sahifasi — markazlashgan app ko'rinishi */
+  .detail-top{gap:18px;margin-top:18px}
+  .detail-top > div:first-child{display:flex;flex-direction:column;align-items:center}
+  .detail-top h1{text-align:center}
+  .detail-top .tags{justify-content:center}
+  .detail-top p{text-align:center;margin:0 auto}
+
+  /* O'quvchi — chetdan-chetga to'liq ekran */
+  .reader{padding:0}
+  .reader img{border-radius:0;margin-bottom:0}
+  .reader-bar{padding:12px 10px}
+
+  /* Pastki menyu — kattaroq, faol tugma "pill" bilan */
+  .bottomnav a{padding:7px 4px}
+  .bottomnav a .i{font-size:1.45rem}
+  .bottomnav a.on{background:rgba(245,185,66,.1);color:var(--gold)}
+
+  /* Kartochkalar telefonda yumshoqroq */
+  .card{border-radius:14px}
+  .card:hover{transform:none}
+  .panel{border-radius:14px}
+}
+
+/* ======== NOUTBUK / PC = TO'LIQ VEB-SAYT KO'RINISHI ======== */
+@media(min-width:821px){
+  .bottomnav{display:none !important}
+  .grid{grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:24px}
+  .h-scroll{display:grid}
+  .container{padding:0 32px}
+  .hero{padding:80px 0 50px}
+  .section{padding:44px 0}
+  .nav-links a{position:relative}
+  .nav-links a::after{content:"";position:absolute;left:14px;right:14px;bottom:4px;
+    height:2px;border-radius:2px;background:linear-gradient(90deg,var(--gold),var(--pink));
+    transform:scaleX(0);transition:transform .2s;transform-origin:left}
+  .nav-links a:hover::after{transform:scaleX(1)}
+  .reader{padding:28px 20px}
+  .fab{padding:12px 18px;font-size:.95rem}
 }
 
 @media(max-width:720px){
@@ -658,7 +1043,6 @@ footer{border-top:1px solid var(--border);margin-top:50px;padding:36px 0;color:v
   .panel{padding:18px}
   .sec-head h2{font-size:1.3rem}
   .card .title{font-size:.9rem}
-  .card .cover{padding:10px}
 }
 
 @media(max-width:380px){
@@ -721,7 +1105,7 @@ BASE = """
   {% if user %}<a href="{{ url_for('bookmarks') }}" class="{{ 'on' if '/bookmark' in request.path }}"><span class="i">☆</span>Saqlangan</a>{% endif %}
   <a href="{{ url_for('coins') }}" class="{{ 'on' if '/coins' in request.path }}"><span class="i">◉</span>Tanga</a>
   {% if user %}<a href="{{ url_for('profile') }}" class="{{ 'on' if '/profile' in request.path or '/admin' in request.path }}"><span class="i">👤</span>Profil</a>
-  {% else %}<a href="{{ url_for('login') }}" class="{{ 'on' if '/login' in request.path }}"><span class="i">👤</span>Kirish</a>{% endif %}
+  {% else %}<a href="{{ url_for('login') }}" class="{{ 'on' if '/login' in request.path or '/verify' in request.path or '/complete' in request.path }}"><span class="i">👤</span>Kirish</a>{% endif %}
 </nav>
 
 <footer><div class="container foot-in">
@@ -788,7 +1172,7 @@ def index():
         <a href="{{ url_for('catalog') }}?sort=rating">Barchasi →</a>
       </div>
       {% if popular %}
-      <div class="grid">
+      <div class="grid h-scroll">
         {% for m in popular %}{{ card(m)|safe }}{% endfor %}
       </div>
       {% else %}<div class="empty">Hali manga qo'shilmagan.</div>{% endif %}
@@ -1077,87 +1461,6 @@ def bookmarks():
     return render(tpl, items=items, card=card_macro, title="Saqlanganlar")
 
 
-# ----------------------------------------------------------------- AUTH
-@app.route("/register")
-def register():
-    # Faqat Google orqali kirish — ro'yxatdan o'tish alohida emas
-    return redirect(url_for("login"))
-
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if current_user():
-        return redirect(url_for("index"))
-
-    # POST -> zaxira admin (login/parol)
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        pw = request.form.get("password", "")
-        u = get_db().execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
-        if u and u["password"] and check_password_hash(u["password"], pw):
-            session["uid"] = u["id"]
-            flash("Tizimga kirdingiz.", "ok")
-            nxt = request.args.get("next")
-            return redirect(nxt or url_for("index"))
-        flash("Login yoki parol xato.", "err")
-
-    tpl = """
-    <div class="form-wrap panel fade">
-      <h3>Tizimga kirish</h3>
-      <p style="color:var(--muted);font-size:.92rem;margin-bottom:6px">
-        Google akkauntingiz orqali bir marta bosib kiring — parol kerak emas.</p>
-
-      {% if GOOGLE_ENABLED %}
-        <script src="https://accounts.google.com/gsi/client" async></script>
-        <div id="g_id_onload"
-             data-client_id="{{ GOOGLE_CLIENT_ID }}"
-             data-callback="handleGoogle"
-             data-auto_prompt="false"></div>
-        <div class="gbtn-wrap">
-          <div class="g_id_signin"
-               data-type="standard" data-theme="filled_black"
-               data-size="large" data-text="continue_with"
-               data-shape="pill" data-logo_alignment="left"></div>
-        </div>
-        <script>
-          function handleGoogle(resp){
-            fetch("{{ url_for('auth_google') }}{% if request.args.get('next') %}?next={{ request.args.get('next')|urlencode }}{% endif %}", {
-              method:"POST",
-              headers:{"Content-Type":"application/x-www-form-urlencoded"},
-              body:"credential="+encodeURIComponent(resp.credential)
-            }).then(function(r){return r.json();}).then(function(d){
-              if(d.ok){ window.location = d.redirect || "/"; }
-              else { alert(d.error || "Kirishda xatolik"); }
-            }).catch(function(){ alert("Tarmoq xatosi. Qayta urinib ko'ring."); });
-          }
-        </script>
-      {% else %}
-        <div style="padding:14px;background:var(--bg2);border:1px dashed var(--gold);border-radius:12px;color:var(--gold-soft);font-size:.9rem">
-          Google kirish hali sozlanmagan. Admin <code>GOOGLE_CLIENT_ID</code> ni Railway
-          Variables bo'limiga qo'shishi kerak. Vaqtincha pastdagi admin kirishidan foydalaning.
-        </div>
-      {% endif %}
-
-      <details class="admin-fallback">
-        <summary>Admin sifatida parol bilan kirish</summary>
-        <form method="post" style="margin-top:12px">
-          <label>Login</label><input name="username" autocomplete="username">
-          <label>Parol</label><input type="password" name="password" autocomplete="current-password">
-          <button class="btn btn-ghost" style="width:100%;margin-top:16px">Kirish</button>
-        </form>
-      </details>
-    </div>
-    """
-    return render(tpl, title="Kirish")
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    flash("Tizimdan chiqdingiz.", "ok")
-    return redirect(url_for("index"))
-
-
 @app.route("/profile")
 @login_required
 def profile():
@@ -1177,7 +1480,7 @@ def profile():
             <div>
               <div style="color:var(--muted);font-size:.85rem">Sizning ID raqamingiz</div>
               <div style="margin-top:6px"><span class="pageid">ID: {{ user['id'] }}</span></div>
-              {% if user['email'] %}<div style="color:var(--muted);font-size:.82rem;margin-top:8px">{{ user['email'] }}</div>{% endif %}
+              {% if user['phone'] %}<div style="color:var(--muted);font-size:.82rem;margin-top:8px">📱 +{{ user['phone'] }}</div>{% endif %}
               <div style="color:var(--muted);font-size:.82rem;margin-top:6px">Tanga olishda adminga shu ID ni yuboring.</div>
             </div>
           </div>
@@ -1225,7 +1528,7 @@ def coins():
           <li>Quyidagi <strong style="color:var(--gold)">Telegram admin</strong> tugmasini bosing.</li>
           <li>Kerakli tanga paketini tanlab, adminga to'lovni amalga oshiring.</li>
           {% if user %}<li>Adminga o'z <strong style="color:var(--gold)">ID: {{ user['id'] }}</strong> raqamingizni yuboring.</li>
-          {% else %}<li>Avval <a href="{{ url_for('login') }}" style="color:var(--gold)">Google orqali kiring</a> — sizga ID beriladi.</li>{% endif %}
+          {% else %}<li>Avval <a href="{{ url_for('login') }}" style="color:var(--gold)">telefon raqamingiz bilan kiring</a> — sizga ID beriladi.</li>{% endif %}
           <li>Admin pulni qabul qilgach, tangalar balansingizga tushadi.</li>
         </ol>
 
@@ -1298,6 +1601,16 @@ def admin():
           <h3>👥 Foydalanuvchilar</h3>
           <p style="color:var(--muted);font-size:.9rem">Barcha foydalanuvchilar ro'yxati.</p>
         </a>
+      </div>
+
+      <div class="panel" style="margin-top:20px">
+        <h3>✈ Telegram kirish boti</h3>
+        <p style="color:var(--muted);font-size:.9rem;margin-bottom:12px">
+          Bot: {% if BOT_ENABLED %}<strong style="color:#8ef0b0">@{{ BOT_USERNAME }} — sozlangan</strong>
+          {% else %}<strong style="color:var(--pink)">sozlanmagan</strong> (Railway Variables ga
+          TELEGRAM_BOT_TOKEN va TELEGRAM_BOT_USERNAME qo'shing){% endif %}</p>
+        <a href="{{ url_for('tg_set_webhook') }}" class="btn btn-tg">🔗 Webhookni ulash / yangilash</a>
+        <div class="hint">Har safar deploy manzili o'zgarsa shu tugmani bir marta bosing.</div>
       </div>
 
       <div class="panel" style="margin-top:20px">
@@ -1393,7 +1706,8 @@ def admin_add_coins():
         <div style="margin-top:18px;padding:16px;background:var(--bg2);border:1px solid var(--border);border-radius:12px">
           <div style="display:flex;justify-content:space-between;align-items:center">
             <div><div style="font-weight:700;font-size:1.1rem">{{ found['username'] }}</div>
-              <span class="pageid">ID: {{ found['id'] }}</span></div>
+              <span class="pageid">ID: {{ found['id'] }}</span>
+              {% if found['phone'] %}<div style="color:var(--muted);font-size:.82rem;margin-top:6px">📱 +{{ found['phone'] }}</div>{% endif %}</div>
             <div style="text-align:right"><div style="color:var(--muted);font-size:.82rem">Hozirgi balans</div>
               <div style="font-family:'Sora';font-size:1.5rem;font-weight:800;color:var(--gold)">◉ {{ found['coins'] }}</div></div>
           </div>
@@ -1424,11 +1738,11 @@ def admin_users():
       <div class="sec-head"><div><span class="eyebrow">Admin</span><h2>Foydalanuvchilar</h2></div>
         <a href="{{ url_for('admin') }}">← Panelga</a></div>
       <div class="panel">
-        <table><tr><th>ID</th><th>Login</th><th>Email</th><th>Tanga</th><th>Rol</th><th></th></tr>
+        <table><tr><th>ID</th><th>Ism</th><th>Telefon</th><th>Tanga</th><th>Rol</th><th></th></tr>
         {% for u in users %}<tr>
           <td><span class="pageid">{{ u['id'] }}</span></td>
           <td>{{ u['username'] }}</td>
-          <td style="color:var(--muted)">{{ u['email'] or '—' }}</td>
+          <td style="color:var(--muted)">{{ ('+' + u['phone']) if u['phone'] else '—' }}</td>
           <td style="color:var(--gold);font-weight:700">◉ {{ u['coins'] }}</td>
           <td>{{ 'Admin' if u['is_admin'] else 'Foydalanuvchi' }}</td>
           <td><a href="{{ url_for('admin_add_coins', uid=u['id']) }}" class="btn btn-ghost" style="padding:6px 12px">Tanga qo'shish</a></td>
@@ -1634,6 +1948,6 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"  {SITE_NAME} ishga tushdi:  http://0.0.0.0:{port}")
     print(f"  Zaxira admin:  login={ADMIN_LOGIN}  parol={ADMIN_PASSWORD}")
-    print(f"  Google kirish: {'YOQILGAN' if GOOGLE_CLIENT_ID else 'sozlanmagan'}")
+    print(f"  Telegram bot:  {'@' + TELEGRAM_BOT_USERNAME if TELEGRAM_BOT_TOKEN else 'sozlanmagan'}")
     print("=" * 60)
     app.run(debug=False, host="0.0.0.0", port=port)
