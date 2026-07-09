@@ -5,6 +5,7 @@
 ==========================================================================
   Texnologiya : Python + Flask + SQLite  (tashqi kutubxona shart emas)
   Muallif uchun: Abdulahad
+  Railway uchun moslashtirilgan variant (2026)
 ==========================================================================
 """
 
@@ -22,21 +23,24 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 # ------------------------------------------------------------------ SOZLAMALAR
 SITE_NAME = "Manga olami"
-# Telegram userneymni to'g'ri havola formatiga o'tkazish uchun to'liq havola yozildi
 TELEGRAM_ADMIN = "https://t.me/animan_only"
 ADMIN_LOGIN = "admin"
 ADMIN_PASSWORD = "admin123"
 COIN_NAME = "tanga"
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DB_PATH = os.path.join(BASE_DIR, "manga_olami.db")
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-ALLOWED_EXT = {"png", "jpg", "jpeg", "webp", "gif"}
+
+# RAILWAY UCHUN MUHIM: Ma'lumotlar o'chib ketmasligi uchun bazani xavfsizroq joyga qo'yamiz.
+# Agar Railway-da "Volume" ulasangiz, uning yo'lini muhit o'zgaruvchisiga (masalan: VOLUME_PATH) yozib qo'ying.
+RAILWAY_VOLUME = os.environ.get("VOLUME_PATH", BASE_DIR)
+DB_PATH = os.path.join(RAILWAY_VOLUME, "manga_olami.db")
+UPLOAD_DIR = os.path.join(RAILWAY_VOLUME, "uploads")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__)
-app.secret_key = "manga-olami-" + secrets.token_hex(16)
+# Maxfiy kalit har safar restart bo'lganda o'zgarib ketmasligi uchun Railway o'zgaruvchisidan yoki qat'iy kalitdan foydalanamiz
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "manga-olami-super-secret-key-12345")
 app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
 
 
@@ -941,7 +945,7 @@ def coins():
           <li>Quyidagi <strong style="color:var(--gold)">Telegram admin</strong> tugmasini bosing.</li>
           <li>Kerakli tanga paketini tanlab, adminga to'lovni amalga oshiring.</li>
           {% if user %}<li>Adminga o'z <strong style="color:var(--gold)">ID: {{ user['id'] }}</strong> raqamingizni yuboring.</li>
-          {% else %}<li>Avval <a href="{{ url_for('register') }}" style="color:var(--gold)">ro'yxatdan o'ting</a> — sizga ID beriladi va uni adminga yuborasiz.</li>{% endif %}
+          {% else %}<li>Avval <a href="{{ url_for('register') }}" style="color:var(--gold)">ro'yxatdan o'teb qo'ying</a> — sizga ID beriladi.</li>{% endif %}
           <li>Admin pulni qabul qilgach, tangalar balansingizga tushadi.</li>
         </ol>
 
@@ -1016,7 +1020,6 @@ def admin():
         </a>
       </div>
 
-      {# ADMIN PANEL ICHIDAGI MANGALAR RO'YXATI VA O'CHIRISH FUNKSIYASI #}
       <div class="panel" style="margin-top:20px">
         <h3>Barcha mangalar boshqaruvi (O'chirish)</h3>
         {% if manga_list %}
@@ -1309,8 +1312,11 @@ def e404(e):
 # ===================================================================== ISHGA TUSHISH
 if __name__ == "__main__":
     init_db()
+    # Railway muhitiga portni dinamik moslash
+    port = int(os.environ.get("PORT", 5000))
     print("=" * 60)
-    print(f"  {SITE_NAME} ishga tushdi:  http://127.0.0.1:5000")
+    print(f"  {SITE_NAME} ishga tushdi:  http://0.0.0.0:{port}")
     print(f"  Admin:  login={ADMIN_LOGIN}  parol={ADMIN_PASSWORD}")
     print("=" * 60)
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    # Production muhitda debug=False bo'lgani ma'qul
+    app.run(debug=False, host="0.0.0.0", port=port)
