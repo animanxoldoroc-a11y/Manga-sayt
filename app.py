@@ -195,6 +195,12 @@ def init_db():
             expires_at   TEXT NOT NULL,
             attempts     INTEGER DEFAULT 0
         );
+
+        -- Sayt sozlamalari (standart avatar, ijtimoiy tarmoqlar, adminlar)
+        CREATE TABLE IF NOT EXISTS settings (
+            key          TEXT PRIMARY KEY,
+            value        TEXT
+        );
         """
     )
     db.commit()
@@ -352,6 +358,64 @@ def uploaded_file(filename):
     return send_from_directory(UPLOAD_DIR, filename)
 
 
+# ------------------------------------------------------------ SAYT SOZLAMALARI
+def get_setting(key, default=""):
+    """settings jadvalidan qiymat o'qiydi."""
+    row = get_db().execute(
+        "SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row and row["value"] else default
+
+
+def set_setting(key, value):
+    """settings jadvaliga qiymat yozadi (bo'sh qiymat = o'chirish)."""
+    db = get_db()
+    db.execute(
+        "INSERT INTO settings (key, value) VALUES (?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, (value or "").strip()))
+    db.commit()
+
+
+# --------------------------------------------------- MANGA OLAMI AVATARI (SVG)
+# Saytning o'z "maskot" avatari — hech kim rasm qo'ymasa shu ko'rinadi.
+# Admin /admin/settings orqali o'zgartira oladi.
+DEFAULT_AVATAR_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+<defs>
+ <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+  <stop offset="0" stop-color="#f5b942"/>
+  <stop offset=".55" stop-color="#ff4d6d"/>
+  <stop offset="1" stop-color="#8b5cf6"/>
+ </linearGradient>
+</defs>
+<circle cx="48" cy="48" r="48" fill="#161232"/>
+<circle cx="48" cy="48" r="45.5" fill="none" stroke="url(#g)" stroke-width="3"/>
+<path d="M28 47 L33 25 L44 37 Q48 35 52 37 L63 25 L68 47
+         Q72 57 66 66 Q58 76 48 76 Q38 76 30 66 Q24 57 28 47 Z"
+      fill="url(#g)"/>
+<path d="M34.5 29 L43 38 Q40 40 38 43 Z" fill="#161232" opacity=".55"/>
+<path d="M61.5 29 L53 38 Q56 40 58 43 Z" fill="#161232" opacity=".55"/>
+<circle cx="40" cy="55" r="3.6" fill="#0b0918"/>
+<circle cx="56" cy="55" r="3.6" fill="#0b0918"/>
+<circle cx="41.2" cy="53.8" r="1.1" fill="#fff"/>
+<circle cx="57.2" cy="53.8" r="1.1" fill="#fff"/>
+<path d="M43.5 64 Q48 68.5 52.5 64" stroke="#0b0918" stroke-width="2.6"
+      fill="none" stroke-linecap="round"/>
+</svg>"""
+
+
+@app.route("/avatar-default.svg")
+def default_avatar():
+    """O'rnatilgan Manga Olami avatari."""
+    return app.response_class(DEFAULT_AVATAR_SVG, mimetype="image/svg+xml")
+
+
+def avatar_of(u):
+    """Foydalanuvchi avatari: o'zi yuklagani -> admin qo'ygan standart -> sayt avatari."""
+    if u is not None and u["avatar"]:
+        return u["avatar"]
+    return get_setting("default_avatar") or url_for("default_avatar")
+
+
 @app.context_processor
 def inject_globals():
     return dict(
@@ -359,6 +423,15 @@ def inject_globals():
         TELEGRAM_ADMIN=TELEGRAM_ADMIN, user=current_user(),
         BOT_USERNAME=TELEGRAM_BOT_USERNAME,
         BOT_ENABLED=bool(TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_USERNAME),
+        avatar_of=avatar_of,
+        # Bog'lanish uchun adminlar (sozlamalardan; bo'sh bo'lsa koddagi asosiy admin)
+        ADMIN1_URL=get_setting("admin1_url") or TELEGRAM_ADMIN,
+        ADMIN1_NAME=get_setting("admin1_name") or "Bosh admin",
+        ADMIN2_URL=get_setting("admin2_url"),
+        ADMIN2_NAME=get_setting("admin2_name") or "2-admin",
+        # Ijtimoiy tarmoqlar (admin sozlamalardan qo'yadi, bo'sh bo'lsa ko'rinmaydi)
+        IG_URL=get_setting("instagram_url"),
+        TG_CHANNEL=get_setting("tg_channel_url"),
     )
 
 
@@ -503,6 +576,7 @@ def login():
         return redirect(url_for("index"))
 
     show_bot_help = False
+    existing_acc = False
     phone_val = ""
 
     if request.method == "POST":
@@ -538,24 +612,42 @@ def login():
                                     else url_for("verify"))
                 if err == "not_linked":
                     show_bot_help = True
-                    flash("Bu raqam hali botga ulanmagan. Avval 1-qadamni bajaring.", "warn")
+                    # Bu raqamga akkaunt bormi? Bo'lsa — qayta ro'yxat SHART EMAS
+                    existing_acc = get_db().execute(
+                        "SELECT 1 FROM users WHERE phone=?", (phone,)).fetchone() is not None
+                    if existing_acc:
+                        flash("Bu raqamga akkaunt allaqachon ochilgan ✓ Qaytadan "
+                              "ro'yxatdan o'tish shart emas — kod olish uchun "
+                              "botga raqamingizni ulang.", "warn")
+                    else:
+                        flash("Bu raqam hali botga ulanmagan. Avval 1-qadamni bajaring.", "warn")
                 else:
                     flash("Kod yuborishda xatolik. Botga /start yozib, qayta urining.", "err")
 
     tpl = """
     <div class="form-wrap panel fade">
-      <h3>Telefon raqam bilan kirish</h3>
+      <div style="text-align:center;margin-bottom:18px">
+        <img src="{{ url_for('default_avatar') }}" alt="" style="width:72px;height:72px;margin:0 auto 10px;display:block">
+        <h3 style="margin-bottom:4px">Telefon raqam bilan kirish</h3>
+        <p style="color:var(--muted);font-size:.86rem">Parol yo'q — kod Telegramingizga keladi</p>
+      </div>
+
+      <div class="chip-note">
+        👤 Avval akkaunt ochganmisiz? Xuddi shu raqamni kiriting —
+        <strong>o'sha akkauntingizga kirasiz</strong>, qayta ro'yxatdan o'tilmaydi.
+      </div>
 
       {% if BOT_ENABLED %}
-      <div style="margin:14px 0;padding:14px;background:var(--bg2);border:1px solid var(--border);border-radius:12px">
-        <div style="font-weight:700;margin-bottom:8px">1-qadam <span style="color:var(--muted);font-weight:500">(faqat birinchi marta)</span></div>
+      <div class="step-box {{ 'glow' if existing_acc or show_bot_help }}">
+        <div class="step-t"><span class="step-n">1</span> Botga ulanish
+          <span style="color:var(--muted);font-weight:500;font-size:.82rem">(faqat birinchi marta)</span></div>
         <p style="color:var(--muted);font-size:.9rem;margin-bottom:12px">
           Telegram botimizga kirib, <strong>«📱 Raqamni yuborish»</strong> tugmasini bosing.</p>
         <a href="https://t.me/{{ BOT_USERNAME }}" target="_blank" class="btn btn-tg" style="width:100%">✈ @{{ BOT_USERNAME }} botni ochish</a>
       </div>
 
-      <div style="margin:14px 0;padding:14px;background:var(--bg2);border:1px solid {{ 'var(--gold)' if show_bot_help else 'var(--border)' }};border-radius:12px">
-        <div style="font-weight:700;margin-bottom:8px">2-qadam</div>
+      <div class="step-box">
+        <div class="step-t"><span class="step-n">2</span> Kod olish</div>
         <p style="color:var(--muted);font-size:.9rem;margin-bottom:6px">
           Telefon raqamingizni kiriting — kirish kodi Telegramingizga boradi.</p>
         <form method="post">
@@ -588,8 +680,8 @@ def login():
       </details>
     </div>
     """
-    return render(tpl, show_bot_help=show_bot_help, phone_val=phone_val,
-                  title="Kirish")
+    return render(tpl, show_bot_help=show_bot_help, existing_acc=existing_acc,
+                  phone_val=phone_val, title="Kirish")
 
 
 @app.route("/verify", methods=["GET", "POST"])
@@ -626,7 +718,7 @@ def verify():
             db.commit()
             u = db.execute("SELECT * FROM users WHERE phone=?", (phone,)).fetchone()
             if u:
-                # Eski akkaunt — o'sha akkauntga kiradi
+                # Eski akkaunt — QAYTA RO'YXATDAN O'TILMAYDI, o'sha akkauntga kiradi
                 if ADMIN_PHONE and normalize_phone(ADMIN_PHONE) == phone and not u["is_admin"]:
                     db.execute("UPDATE users SET is_admin=1 WHERE id=?", (u["id"],))
                     db.commit()
@@ -655,6 +747,9 @@ def verify():
                style="text-align:center;font-size:1.4rem;letter-spacing:.4em;font-weight:700">
         <button class="btn btn-primary" style="width:100%;margin-top:18px">Tasdiqlash</button>
       </form>
+      {% if BOT_ENABLED %}
+      <a href="https://t.me/{{ BOT_USERNAME }}" target="_blank" class="btn btn-tg" style="width:100%;margin-top:12px">✈ Kod kelmadimi? Botni ochish</a>
+      {% endif %}
       <a href="{{ url_for('login') }}" style="display:block;margin-top:16px;text-align:center;color:var(--muted);font-size:.88rem">← Boshqa raqam / yangi kod olish</a>
     </div>
     """
@@ -723,6 +818,7 @@ CSS = """
   --bg:#0b0918; --bg2:#100d22; --surface:#161232; --surface2:#1d1840;
   --border:#2c2658; --border2:#3a3370; --text:#eceaff; --muted:#9a94c4;
   --gold:#f5b942; --gold-soft:#ffcf6b; --pink:#ff4d6d; --violet:#8b5cf6;
+  --tg:#2aa9e0;
   --radius:16px; --shadow:0 14px 46px rgba(0,0,0,.5);
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -731,6 +827,7 @@ body{
   background:
     radial-gradient(1000px 560px at 12% -12%, rgba(139,92,246,.22), transparent 60%),
     radial-gradient(900px 560px at 100% -6%, rgba(245,185,66,.12), transparent 55%),
+    radial-gradient(760px 500px at 50% 115%, rgba(255,77,109,.08), transparent 60%),
     var(--bg);
   color:var(--text); font-family:'Inter',system-ui,-apple-system,sans-serif;
   min-height:100vh; line-height:1.55; -webkit-font-smoothing:antialiased;
@@ -746,44 +843,95 @@ img{display:block;max-width:100%}
 
 @keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
 .fade{animation:fadeUp .5s ease both}
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}
 
 /* ---- Navbar ---- */
 .nav{position:sticky;top:0;z-index:60;
   background:rgba(11,9,24,.86);backdrop-filter:blur(16px);
   border-bottom:1px solid var(--border)}
+.nav::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(245,185,66,.5),rgba(255,77,109,.5),transparent)}
 .nav-in{display:flex;align-items:center;gap:18px;height:66px}
 .brand{font-family:'Unbounded',sans-serif;font-weight:800;font-size:1.35rem;
-  letter-spacing:.5px;background:linear-gradient(100deg,var(--gold),var(--pink));
-  -webkit-background-clip:text;background-clip:text;color:transparent;white-space:nowrap}
+  letter-spacing:.5px;white-space:nowrap;
+  background:linear-gradient(100deg,var(--gold),var(--pink),var(--violet),var(--gold));
+  background-size:260% 100%;-webkit-background-clip:text;background-clip:text;
+  color:transparent;animation:brandflow 9s linear infinite}
+@keyframes brandflow{to{background-position:260% 0}}
 .nav-links{display:flex;gap:6px;flex:1;flex-wrap:wrap}
 .nav-links a{padding:8px 14px;border-radius:10px;color:var(--muted);
   font-weight:600;font-size:.95rem;transition:.15s}
 .nav-links a:hover{color:var(--text);background:var(--surface)}
 .nav-right{display:flex;align-items:center;gap:10px;margin-left:auto}
-.avatar{width:34px;height:34px;border-radius:50%;object-fit:cover;
-  border:2px solid var(--gold)}
+
+/* ---- Avatar (gradient halqali) ---- */
+.avatar{width:38px;height:38px;border-radius:50%;object-fit:cover;padding:2px;
+  background:linear-gradient(135deg,var(--gold),var(--pink) 55%,var(--violet))}
+.avatar-xl{width:104px;height:104px;padding:3px;
+  box-shadow:0 10px 34px rgba(255,77,109,.25)}
+.avatar-form input[type=file]{margin-top:0}
+
 .coin-pill{display:flex;align-items:center;gap:7px;padding:7px 14px;
   border-radius:999px;background:linear-gradient(120deg,#3a2f10,#2a2450);
   border:1px solid var(--gold);font-weight:700;color:var(--gold-soft)}
 .coin-pill .dot{width:16px;height:16px;border-radius:50%;
   background:radial-gradient(circle at 35% 30%,#ffe6a0,var(--gold));
   box-shadow:0 0 10px rgba(245,185,66,.6)}
-.nav-burger{display:none;background:var(--surface);border:1px solid var(--border);
-  color:var(--text);width:44px;height:40px;border-radius:11px;font-size:1.3rem;
-  cursor:pointer;align-items:center;justify-content:center}
 
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;
   padding:9px 18px;border-radius:11px;font-weight:700;font-size:.95rem;cursor:pointer;
   border:1px solid transparent;transition:.15s;white-space:nowrap}
-.btn-primary{background:linear-gradient(120deg,var(--gold),var(--pink));color:#1a1030}
+.btn-primary{background:linear-gradient(120deg,var(--gold),var(--pink));color:#1a1030;
+  box-shadow:0 4px 18px rgba(255,77,109,.2)}
 .btn-primary:hover{filter:brightness(1.08);transform:translateY(-1px);
-  box-shadow:0 8px 24px rgba(255,77,109,.28)}
+  box-shadow:0 8px 24px rgba(255,77,109,.32)}
 .btn-danger{background:linear-gradient(120deg,var(--pink),#ff1a40);color:#fff}
 .btn-danger:hover{filter:brightness(1.08);transform:translateY(-1px)}
 .btn-ghost{background:var(--surface);border-color:var(--border);color:var(--text)}
 .btn-ghost:hover{background:var(--surface2);border-color:var(--border2)}
 .btn-tg{background:linear-gradient(120deg,#2aa9e0,#1c7fc4);color:#fff}
 .btn-tg:hover{filter:brightness(1.08)}
+.btn-ig{background:linear-gradient(45deg,#f9ce34,#ee2a7b 55%,#6228d7);color:#fff}
+.btn-ig:hover{filter:brightness(1.08)}
+
+/* ---- Ijtimoiy tarmoq chiplar ---- */
+.socials{display:flex;gap:10px;flex-wrap:wrap}
+.soc{display:inline-flex;align-items:center;gap:9px;padding:10px 16px;
+  border-radius:999px;font-weight:700;font-size:.9rem;color:#fff;transition:.18s;
+  box-shadow:0 6px 20px rgba(0,0,0,.35)}
+.soc:hover{transform:translateY(-2px) scale(1.02);filter:brightness(1.08)}
+.soc .si{width:24px;height:24px;border-radius:50%;display:grid;place-items:center;
+  background:rgba(255,255,255,.22);font-size:.85rem}
+.soc.tg{background:linear-gradient(120deg,#2aa9e0,#1c7fc4)}
+.soc.ig{background:linear-gradient(45deg,#f9ce34,#ee2a7b 55%,#6228d7)}
+
+/* ---- Admin bilan bog'lanish kartalari ---- */
+.admin-cards{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:14px}
+.admin-card{display:flex;align-items:center;gap:13px;padding:15px 16px;
+  border-radius:14px;background:var(--bg2);border:1px solid var(--border);transition:.18s}
+.admin-card:hover{border-color:var(--tg);transform:translateY(-2px);
+  box-shadow:0 8px 26px rgba(42,169,224,.18)}
+.admin-card .ic{width:44px;height:44px;border-radius:50%;flex-shrink:0;
+  display:grid;place-items:center;font-size:1.25rem;color:#fff;
+  background:linear-gradient(135deg,#2aa9e0,#1c7fc4)}
+.admin-card b{display:block;font-size:.98rem}
+.admin-card span{color:var(--muted);font-size:.8rem}
+
+/* ---- Kirish qadamlari ---- */
+.step-box{margin:14px 0;padding:16px;background:var(--bg2);
+  border:1px solid var(--border);border-radius:14px}
+.step-box.glow{border-color:var(--gold);
+  box-shadow:0 0 0 3px rgba(245,185,66,.12)}
+.step-t{display:flex;align-items:center;gap:9px;font-weight:700;margin-bottom:8px}
+.step-n{width:24px;height:24px;border-radius:50%;display:grid;place-items:center;
+  font-size:.8rem;font-weight:800;color:#1a1030;
+  background:linear-gradient(120deg,var(--gold),var(--pink))}
+.chip-note{padding:12px 14px;margin-bottom:6px;border-radius:12px;font-size:.85rem;
+  color:var(--muted);background:rgba(139,92,246,.08);
+  border:1px solid rgba(139,92,246,.35)}
+.chip-note strong{color:var(--gold-soft)}
 
 /* ---- Hero ---- */
 .hero{position:relative;padding:64px 0 40px;overflow:hidden}
@@ -807,7 +955,10 @@ img{display:block;max-width:100%}
   margin-bottom:20px;gap:14px;flex-wrap:wrap}
 .sec-head h2{font-family:'Sora',sans-serif;font-size:1.5rem;font-weight:700}
 .sec-head .eyebrow{color:var(--gold);font-weight:700;font-size:.8rem;
-  letter-spacing:.14em;text-transform:uppercase;display:block;margin-bottom:6px}
+  letter-spacing:.14em;text-transform:uppercase;display:inline-flex;align-items:center;
+  gap:8px;margin-bottom:6px}
+.sec-head .eyebrow::before{content:"";width:20px;height:2px;border-radius:2px;
+  background:linear-gradient(90deg,var(--gold),var(--pink))}
 .sec-head a{color:var(--muted);font-weight:600;font-size:.9rem}
 .sec-head a:hover{color:var(--gold)}
 
@@ -817,6 +968,10 @@ img{display:block;max-width:100%}
   border-radius:var(--radius);overflow:hidden;transition:.2s;position:relative}
 .card:hover{transform:translateY(-5px);border-color:var(--violet);box-shadow:var(--shadow)}
 .card .cover-wrap{position:relative;overflow:hidden}
+.card .cover-wrap::after{content:"";position:absolute;inset:0;pointer-events:none;
+  background:linear-gradient(115deg,transparent 42%,rgba(255,255,255,.13) 50%,transparent 58%);
+  transform:translateX(-130%);transition:transform .55s ease}
+.card:hover .cover-wrap::after{transform:translateX(130%)}
 .card .cover{aspect-ratio:5/7;width:100%;object-fit:cover;background:var(--surface2);
   transition:transform .45s ease}
 .card:hover .cover{transform:scale(1.06)}
@@ -843,9 +998,11 @@ img{display:block;max-width:100%}
 .row .meta .g{color:var(--muted);font-size:.78rem;margin-top:3px}
 .row .meta .c{color:var(--gold);font-size:.82rem;font-weight:600;margin-top:6px}
 
-/* ---- Panels / forms ---- */
-.panel{background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius);padding:26px}
+/* ---- Panels / forms (nozik gradient hoshiya) ---- */
+.panel{border-radius:var(--radius);padding:26px;border:1px solid transparent;
+  background:
+    linear-gradient(var(--surface),var(--surface)) padding-box,
+    linear-gradient(155deg,rgba(245,185,66,.32),rgba(139,92,246,.22) 45%,var(--border) 80%) border-box}
 .panel h3{font-family:'Sora',sans-serif;font-size:1.2rem;margin-bottom:16px}
 label{display:block;font-weight:600;font-size:.88rem;margin:14px 0 6px;color:var(--muted)}
 input,textarea,select{width:100%;padding:12px 14px;border-radius:11px;
@@ -933,7 +1090,7 @@ footer{border-top:1px solid var(--border);margin-top:50px;padding:36px 0;color:v
   .nav-logout{display:none}
   .brand{font-size:1.15rem}
   .coin-pill{padding:6px 11px}
-  .avatar{width:32px;height:32px}
+  .avatar{width:34px;height:34px}
   .hero{padding:38px 0 24px}
   .hero p{font-size:1rem;margin-top:12px}
   .hero .cta{margin-top:20px}
@@ -949,6 +1106,7 @@ footer{border-top:1px solid var(--border);margin-top:50px;padding:36px 0;color:v
   .reader{padding:10px 8px}
   .reader-bar{padding:12px 0}
   .reader-bar .btn{flex:1}
+  .admin-cards{grid-template-columns:1fr}
 
   /* Suzuvchi Telegram tugmasi — pastki menyu tepasiga, ixcham */
   .fab{padding:13px;font-size:0;right:14px;
@@ -1059,6 +1217,7 @@ BASE = """
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0b0918">
 <title>{{ title or SITE_NAME }}</title>
+<link rel="icon" type="image/svg+xml" href="{{ url_for('default_avatar') }}">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Sora:wght@600;700;800&family=Unbounded:wght@700;800&display=swap" rel="stylesheet">
 <style>{{ css|safe }}</style>
@@ -1077,8 +1236,7 @@ BASE = """
     {% if user %}
       <a href="{{ url_for('coins') }}" class="coin-pill"><span class="dot"></span>{{ user['coins'] }}</a>
       <a href="{{ url_for('profile') }}" title="{{ user['username'] }}">
-        {% if user['avatar'] %}<img class="avatar" src="{{ user['avatar'] }}" alt="">
-        {% else %}<span class="btn btn-ghost">{{ user['username'] }}</span>{% endif %}
+        <img class="avatar" src="{{ avatar_of(user) }}" alt="{{ user['username'] }}">
       </a>
       <a href="{{ url_for('logout') }}" class="btn btn-ghost nav-logout">Chiqish</a>
     {% else %}
@@ -1097,7 +1255,7 @@ BASE = """
 
 <main>{{ body|safe }}</main>
 
-<a href="{{ TELEGRAM_ADMIN }}" target="_blank" class="fab" title="Telegram admin">✈ Admin</a>
+<a href="{{ ADMIN1_URL }}" target="_blank" class="fab" title="Telegram admin">✈ Admin</a>
 
 <nav class="bottomnav">
   <a href="{{ url_for('index') }}" class="{{ 'on' if request.path == '/' }}"><span class="i">🏠</span>Bosh</a>
@@ -1112,6 +1270,10 @@ BASE = """
   <div style="max-width:340px">
     <div class="brand">◈ {{ SITE_NAME }}</div>
     <p style="margin-top:12px;font-size:.92rem">Eng sara manga, manhwa va manhualarni o'zbek tilida sifatli tarjimada o'qing.</p>
+    <div class="socials" style="margin-top:16px">
+      {% if TG_CHANNEL %}<a href="{{ TG_CHANNEL }}" target="_blank" class="soc tg"><span class="si">✈</span>Kanal</a>{% endif %}
+      {% if IG_URL %}<a href="{{ IG_URL }}" target="_blank" class="soc ig"><span class="si">📷</span>Instagram</a>{% endif %}
+    </div>
   </div>
   <div class="foot-links">
     <strong style="color:var(--text)">Navigatsiya</strong>
@@ -1121,7 +1283,10 @@ BASE = """
   </div>
   <div class="foot-links">
     <strong style="color:var(--text)">Aloqa</strong>
-    <a href="{{ TELEGRAM_ADMIN }}" target="_blank">Telegram admin</a>
+    <a href="{{ ADMIN1_URL }}" target="_blank">✈ {{ ADMIN1_NAME }}</a>
+    {% if ADMIN2_URL %}<a href="{{ ADMIN2_URL }}" target="_blank">✈ {{ ADMIN2_NAME }}</a>{% endif %}
+    {% if TG_CHANNEL %}<a href="{{ TG_CHANNEL }}" target="_blank">📢 Telegram kanal</a>{% endif %}
+    {% if IG_URL %}<a href="{{ IG_URL }}" target="_blank">📷 Instagram</a>{% endif %}
   </div>
 </div>
 <div class="container" style="margin-top:24px;font-size:.85rem">© 2026 {{ SITE_NAME }}. Barcha huquqlar himoyalangan.</div>
@@ -1461,6 +1626,7 @@ def bookmarks():
     return render(tpl, items=items, card=card_macro, title="Saqlanganlar")
 
 
+# ------------------------------------------------------------------ PROFIL
 @app.route("/profile")
 @login_required
 def profile():
@@ -1473,10 +1639,11 @@ def profile():
     tpl = """
     <section class="section"><div class="container" style="max-width:820px">
       <div class="sec-head"><div><span class="eyebrow">Hisob</span><h2>{{ user['username'] }}</h2></div></div>
+
       <div class="panel">
         <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px">
-          <div style="display:flex;gap:14px;align-items:center">
-            {% if user['avatar'] %}<img class="avatar" style="width:56px;height:56px" src="{{ user['avatar'] }}" alt="">{% endif %}
+          <div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap">
+            <img class="avatar avatar-xl" src="{{ avatar_of(user) }}" alt="">
             <div>
               <div style="color:var(--muted);font-size:.85rem">Sizning ID raqamingiz</div>
               <div style="margin-top:6px"><span class="pageid">ID: {{ user['id'] }}</span></div>
@@ -1490,6 +1657,23 @@ def profile():
             <a href="{{ url_for('coins') }}" class="btn btn-primary" style="margin-top:6px">Tanga qo'shish</a>
           </div>
         </div>
+      </div>
+
+      <div class="panel" style="margin-top:18px">
+        <h3>📷 Profil rasmi</h3>
+        <form method="post" action="{{ url_for('profile_avatar') }}" enctype="multipart/form-data" class="avatar-form">
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+            <input type="file" name="avatar" accept="image/png,image/jpeg,image/webp,image/gif" required style="flex:1;min-width:200px">
+            <button class="btn btn-primary">Avatarni yangilash</button>
+          </div>
+          <div class="hint">png / jpg / webp / gif formatda. Rasm doira shaklida kesiladi.</div>
+        </form>
+        {% if user['avatar'] %}
+        <form method="post" action="{{ url_for('profile_avatar') }}" style="margin-top:10px">
+          <input type="hidden" name="remove" value="1">
+          <button class="btn btn-ghost">↺ Standart avatarga qaytarish</button>
+        </form>
+        {% endif %}
       </div>
 
       <div class="panel" style="margin-top:18px">
@@ -1514,6 +1698,27 @@ def profile():
     return render(tpl, unlocked=unlocked, title="Profil")
 
 
+@app.route("/profile/avatar", methods=["POST"])
+@login_required
+def profile_avatar():
+    """Foydalanuvchi o'z profil rasmini yuklaydi yoki standartga qaytaradi."""
+    db = get_db()
+    u = current_user()
+    if request.form.get("remove"):
+        db.execute("UPDATE users SET avatar=NULL WHERE id=?", (u["id"],))
+        db.commit()
+        flash("Avatar standart holatga qaytarildi.", "ok")
+    else:
+        url = save_upload(request.files.get("avatar"))
+        if url:
+            db.execute("UPDATE users SET avatar=? WHERE id=?", (url, u["id"]))
+            db.commit()
+            flash("✓ Profil rasmi yangilandi.", "ok")
+        else:
+            flash("Rasm yuklanmadi. png/jpg/webp/gif formatda yuklang.", "err")
+    return redirect(url_for("profile"))
+
+
 # ----------------------------------------------------------- TANGA SOTIB OLISH
 @app.route("/coins")
 def coins():
@@ -1525,7 +1730,7 @@ def coins():
       <div class="panel">
         <h3>Qanday sotib olinadi?</h3>
         <ol style="color:var(--muted);margin:10px 0 0 18px;line-height:2">
-          <li>Quyidagi <strong style="color:var(--gold)">Telegram admin</strong> tugmasini bosing.</li>
+          <li>Quyidagi <strong style="color:var(--gold)">adminlardan biriga</strong> Telegram orqali yozing.</li>
           <li>Kerakli tanga paketini tanlab, adminga to'lovni amalga oshiring.</li>
           {% if user %}<li>Adminga o'z <strong style="color:var(--gold)">ID: {{ user['id'] }}</strong> raqamingizni yuboring.</li>
           {% else %}<li>Avval <a href="{{ url_for('login') }}" style="color:var(--gold)">telefon raqamingiz bilan kiring</a> — sizga ID beriladi.</li>{% endif %}
@@ -1538,8 +1743,26 @@ def coins():
         </div>
         {% endif %}
 
-        <a href="{{ TELEGRAM_ADMIN }}" target="_blank" class="btn btn-tg" style="width:100%;justify-content:center;margin-top:10px">
-          ✈ Telegram admin bilan bog'lanish</a>
+        <div class="admin-cards">
+          <a href="{{ ADMIN1_URL }}" target="_blank" class="admin-card">
+            <span class="ic">✈</span>
+            <span><b>{{ ADMIN1_NAME }}</b><span>Telegram orqali yozish</span></span>
+          </a>
+          {% if ADMIN2_URL %}
+          <a href="{{ ADMIN2_URL }}" target="_blank" class="admin-card">
+            <span class="ic">✈</span>
+            <span><b>{{ ADMIN2_NAME }}</b><span>Telegram orqali yozish</span></span>
+          </a>
+          {% endif %}
+        </div>
+
+        {% if TG_CHANNEL or IG_URL %}
+        <div class="divider">Bizni kuzatib boring</div>
+        <div class="socials" style="justify-content:center">
+          {% if TG_CHANNEL %}<a href="{{ TG_CHANNEL }}" target="_blank" class="soc tg"><span class="si">✈</span>Telegram kanal</a>{% endif %}
+          {% if IG_URL %}<a href="{{ IG_URL }}" target="_blank" class="soc ig"><span class="si">📷</span>Instagram</a>{% endif %}
+        </div>
+        {% endif %}
       </div>
 
       <div class="sec-head" style="margin-top:30px"><h2 style="font-size:1.25rem">Tanga paketlari</h2></div>
@@ -1550,7 +1773,7 @@ def coins():
           <div style="font-family:'Sora';font-size:1.8rem;font-weight:800;color:var(--gold)">{{ amount }}</div>
           <div style="color:var(--muted);font-size:.85rem">tanga</div>
           <div style="margin:12px 0;font-weight:700">{{ price }} so'm</div>
-          <a href="{{ TELEGRAM_ADMIN }}" target="_blank" class="btn btn-primary" style="width:100%">Sotib olish</a>
+          <a href="{{ ADMIN1_URL }}" target="_blank" class="btn btn-primary" style="width:100%">Sotib olish</a>
         </div>
         {% endfor %}
       </div>
@@ -1601,6 +1824,10 @@ def admin():
           <h3>👥 Foydalanuvchilar</h3>
           <p style="color:var(--muted);font-size:.9rem">Barcha foydalanuvchilar ro'yxati.</p>
         </a>
+        <a href="{{ url_for('admin_settings') }}" class="panel" style="display:block">
+          <h3>🎨 Sayt sozlamalari</h3>
+          <p style="color:var(--muted);font-size:.9rem">Standart avatar, Instagram va Telegram kanal havolalari, adminlar.</p>
+        </a>
       </div>
 
       <div class="panel" style="margin-top:20px">
@@ -1637,6 +1864,96 @@ def admin():
     </div></section>
     """
     return render(tpl, stats=stats, manga_list=manga_list, title="Admin")
+
+
+# ------------------------------------------------- ADMIN: SAYT SOZLAMALARI
+@app.route("/admin/settings", methods=["GET", "POST"])
+@admin_required
+def admin_settings():
+    """Standart avatar, ijtimoiy tarmoq havolalari va adminlar ro'yxati."""
+    if request.method == "POST":
+        # --- Standart avatar ---
+        if request.form.get("reset_avatar"):
+            set_setting("default_avatar", "")
+            flash("Standart avatar sayt avatariga qaytarildi.", "ok")
+        else:
+            up = save_upload(request.files.get("default_avatar_file"))
+            av_url = request.form.get("default_avatar_url", "").strip()
+            if up:
+                set_setting("default_avatar", up)
+            elif av_url:
+                set_setting("default_avatar", av_url)
+
+        # --- Ijtimoiy tarmoqlar va adminlar ---
+        for key in ("instagram_url", "tg_channel_url",
+                    "admin1_url", "admin1_name",
+                    "admin2_url", "admin2_name"):
+            set_setting(key, request.form.get(key, "").strip())
+
+        flash("✓ Sozlamalar saqlandi.", "ok")
+        return redirect(url_for("admin_settings"))
+
+    vals = {k: get_setting(k) for k in (
+        "default_avatar", "instagram_url", "tg_channel_url",
+        "admin1_url", "admin1_name", "admin2_url", "admin2_name")}
+
+    tpl = """
+    <section class="section"><div class="container" style="max-width:640px">
+      <div class="sec-head"><div><span class="eyebrow">Admin</span><h2>Sayt sozlamalari</h2></div>
+        <a href="{{ url_for('admin') }}">← Panelga</a></div>
+
+      <form method="post" enctype="multipart/form-data">
+
+        <div class="panel">
+          <h3>🖼 Standart avatar</h3>
+          <p style="color:var(--muted);font-size:.88rem">Rasm qo'ymagan barcha foydalanuvchilarda
+            shu avatar ko'rinadi. Hozirgisi:</p>
+          <div style="display:flex;align-items:center;gap:16px;margin:14px 0">
+            <img class="avatar avatar-xl" style="width:84px;height:84px"
+                 src="{{ vals['default_avatar'] or url_for('default_avatar') }}" alt="">
+            <div class="hint">{{ 'Admin yuklagan rasm' if vals['default_avatar'] else 'Saytning o\\'z avatari (o\\'rnatilgan)' }}</div>
+          </div>
+          <label>Yangi rasm yuklash</label>
+          <input type="file" name="default_avatar_file" accept="image/*">
+          <label>yoki rasm URL manzili</label>
+          <input name="default_avatar_url" placeholder="https://...">
+          <div class="check"><input type="checkbox" name="reset_avatar" id="rsav">
+            <label for="rsav" style="margin:0">Saytning o'z avatariga qaytarish</label></div>
+        </div>
+
+        <div class="panel" style="margin-top:18px">
+          <h3>🌐 Ijtimoiy tarmoqlar</h3>
+          <p style="color:var(--muted);font-size:.88rem">Havola qo'yilsa — sayt pastida va
+            "Tanga olish" sahifasida chiroyli tugma bo'lib chiqadi. Bo'sh qoldirsangiz ko'rinmaydi.</p>
+          <label>📢 Telegram kanal havolasi</label>
+          <input name="tg_channel_url" value="{{ vals['tg_channel_url'] }}" placeholder="https://t.me/kanal_nomi">
+          <label>📷 Instagram havolasi</label>
+          <input name="instagram_url" value="{{ vals['instagram_url'] }}" placeholder="https://instagram.com/sahifa_nomi">
+        </div>
+
+        <div class="panel" style="margin-top:18px">
+          <h3>✈ Adminlar (bog'lanish uchun)</h3>
+          <div class="row-2">
+            <div><label>1-admin ismi</label>
+              <input name="admin1_name" value="{{ vals['admin1_name'] }}" placeholder="Bosh admin"></div>
+            <div><label>1-admin Telegram havolasi</label>
+              <input name="admin1_url" value="{{ vals['admin1_url'] }}" placeholder="{{ TELEGRAM_ADMIN }}"></div>
+          </div>
+          <div class="hint">Bo'sh qoldirilsa, koddagi asosiy admin havolasi ishlatiladi.</div>
+          <div class="row-2" style="margin-top:8px">
+            <div><label>2-admin ismi</label>
+              <input name="admin2_name" value="{{ vals['admin2_name'] }}" placeholder="masalan: Yordamchi admin"></div>
+            <div><label>2-admin Telegram havolasi</label>
+              <input name="admin2_url" value="{{ vals['admin2_url'] }}" placeholder="https://t.me/username"></div>
+          </div>
+          <div class="hint">2-admin havolasi qo'yilsa — "Tanga olish" sahifasi va footerda ikkinchi karta paydo bo'ladi.</div>
+        </div>
+
+        <button class="btn btn-primary" style="width:100%;margin-top:18px">💾 Sozlamalarni saqlash</button>
+      </form>
+    </div></section>
+    """
+    return render(tpl, vals=vals, TELEGRAM_ADMIN=TELEGRAM_ADMIN, title="Sayt sozlamalari")
 
 
 @app.route("/admin/delete-manga/<int:manga_id>", methods=["POST"])
@@ -1705,9 +2022,12 @@ def admin_add_coins():
         {% if found %}
         <div style="margin-top:18px;padding:16px;background:var(--bg2);border:1px solid var(--border);border-radius:12px">
           <div style="display:flex;justify-content:space-between;align-items:center">
-            <div><div style="font-weight:700;font-size:1.1rem">{{ found['username'] }}</div>
-              <span class="pageid">ID: {{ found['id'] }}</span>
-              {% if found['phone'] %}<div style="color:var(--muted);font-size:.82rem;margin-top:6px">📱 +{{ found['phone'] }}</div>{% endif %}</div>
+            <div style="display:flex;gap:12px;align-items:center">
+              <img class="avatar" style="width:46px;height:46px" src="{{ avatar_of(found) }}" alt="">
+              <div><div style="font-weight:700;font-size:1.1rem">{{ found['username'] }}</div>
+                <span class="pageid">ID: {{ found['id'] }}</span>
+                {% if found['phone'] %}<div style="color:var(--muted);font-size:.82rem;margin-top:6px">📱 +{{ found['phone'] }}</div>{% endif %}</div>
+            </div>
             <div style="text-align:right"><div style="color:var(--muted);font-size:.82rem">Hozirgi balans</div>
               <div style="font-family:'Sora';font-size:1.5rem;font-weight:800;color:var(--gold)">◉ {{ found['coins'] }}</div></div>
           </div>
@@ -1738,8 +2058,9 @@ def admin_users():
       <div class="sec-head"><div><span class="eyebrow">Admin</span><h2>Foydalanuvchilar</h2></div>
         <a href="{{ url_for('admin') }}">← Panelga</a></div>
       <div class="panel">
-        <table><tr><th>ID</th><th>Ism</th><th>Telefon</th><th>Tanga</th><th>Rol</th><th></th></tr>
+        <table><tr><th></th><th>ID</th><th>Ism</th><th>Telefon</th><th>Tanga</th><th>Rol</th><th></th></tr>
         {% for u in users %}<tr>
+          <td><img class="avatar" style="width:34px;height:34px" src="{{ avatar_of(u) }}" alt=""></td>
           <td><span class="pageid">{{ u['id'] }}</span></td>
           <td>{{ u['username'] }}</td>
           <td style="color:var(--muted)">{{ ('+' + u['phone']) if u['phone'] else '—' }}</td>
